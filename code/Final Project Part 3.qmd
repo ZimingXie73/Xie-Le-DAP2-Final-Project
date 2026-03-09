@@ -1,0 +1,1472 @@
+---
+title: "Final Project Part 3"
+author: "Ziming Xie"
+format:
+  pdf:
+    include-in-header:
+      text: |
+        % Enable wrapping for Pandoc code blocks in PDF
+        \usepackage{fvextra}
+        \usepackage{float}
+        \usepackage{makecell}
+        \usepackage{booktabs}
+        \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+editor: source
+execute-dir: project
+execute: 
+    echo: true
+---
+
+
+```{python}
+# setup
+import geopandas as gpd
+from os.path import join
+import altair as alt
+import pandas as pd
+import numpy as np
+import time
+import seaborn as sns
+
+import warnings 
+warnings.filterwarnings('ignore')
+alt.renderers.enable("png")
+alt.data_transformers.disable_max_rows()
+
+data_path = 'data/external'
+
+# improve graph resolution
+import tempfile 
+from IPython.display import SVG, display, Image
+import vl_convert as vlc
+
+def display_altair_png(chart, scale=2):
+    """
+    Render an Altair chart to a PNG and display it inline.
+
+    Parameters
+    ----------
+    chart : altair.Chart
+        Altair chart object to render.
+    scale : int, optional
+        Resolution scaling factor for the PNG (default = 2). Use scale=2 for standard slides. Use scale = 3–4 for dense figures or PDF exports.
+    """
+    png_bytes = vlc.vegalite_to_png(chart.to_dict(), scale=scale)
+
+    # Write to a temporary PNG file and display
+    with tempfile.NamedTemporaryFile(suffix=".png") as tmp:
+        tmp.write(png_bytes)
+        tmp.flush()
+        display(Image(filename=tmp.name))
+```
+
+```{python}
+import os
+import re
+import warnings
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+import matplotlib.patches as mpatches
+from shapely.geometry import LineString
+import altair as alt
+import seaborn as sns
+```
+
+```{python}
+Path = "/Users/xieziming/Xie-Le-DAP2-Final-Project/data/derived-data"
+district_path = os.path.join(Path, "District")
+district_gdf = gpd.read_file(district_path)
+province_path = os.path.join(Path, "Province")
+province_gdf = gpd.read_file(province_path)
+city_path = os.path.join(Path, "City")
+city_gdf = gpd.read_file(city_path)
+final_data_path = os.path.join(Path, "final_data_clean.csv")
+final_data = pd.read_csv(final_data_path)
+gov_path = os.path.join(Path, "城市治理能力.xlsx")
+gov_df = pd.read_excel(gov_path)
+```
+
+```{python}
+province_gdf = province_gdf[['pr_adcode', 'pr_name', 'geometry']]
+province_gdf['pr_adcode'] = province_gdf['pr_adcode'].astype('Int64')
+province_gdf = province_gdf.rename_geometry('geometry_province')
+
+city_gdf = city_gdf[['ct_adcode', 'ct_name', 'geometry']]
+city_gdf['ct_adcode'] = city_gdf['ct_adcode'].astype('Int64')
+city_gdf = city_gdf.rename_geometry('geometry_city')
+
+district_gdf = district_gdf[['dt_adcode', 'dt_name', 'geometry']]
+district_gdf['dt_adcode'] = district_gdf['dt_adcode'].astype('Int64')
+district_gdf = district_gdf.rename_geometry('geometry_district')
+```
+
+```{python}
+final_data['prov_code'] = (final_data['prov_code'] * 10000).astype('Int64')
+
+so2_cols = [
+    'so2_2005_10kton', 'so2_2010_actual_10kton', 'so2_2010_planned_10kton',
+    'so2_reduction_rate_11th_fyp', 'so2_reduction_target_11th_fyp'
+]
+exist_so2_cols = [c for c in so2_cols if c in final_data.columns]
+province_df = final_data.groupby('prov_code')[exist_so2_cols].first()
+
+firm_counts = pd.crosstab(final_data['prov_code'], final_data['year'])
+if 2005 in firm_counts.columns:
+    province_df['firm_count_2005'] = firm_counts[2005]
+if 2010 in firm_counts.columns:
+    province_df['firm_count_2010'] = firm_counts[2010]
+
+status_types = ['Migrate', 'Exit', 'Entry']
+
+for status in status_types:
+    matched_col = next((c for c in final_data.columns if c.lower() == status.lower()), None)
+    if matched_col:
+        province_df[f'{status.lower()}_count'] = final_data.groupby('prov_code')[matched_col].sum()
+
+if 'entry_count' not in province_df.columns:
+    status_col_name = next((c for c in final_data.columns if c.lower() in ['status', 'firm_status', 'type']), None)
+    if status_col_name:
+        status_crosstab = pd.crosstab(final_data['prov_code'], final_data[status_col_name])
+        for col in status_crosstab.columns:
+            if str(col).lower() in [s.lower() for s in status_types]:
+                province_df[f'{str(col).lower()}_count'] = status_crosstab[col]
+
+province_df = province_df.reset_index()
+
+display(province_df.head(10))
+```
+
+```{python}
+province_merged_gdf = province_gdf.merge(
+    province_df, 
+    left_on='pr_adcode',   
+    right_on='prov_code',  
+    how='left'
+)
+
+print(f"Total provinces in map: {len(province_merged_gdf)}")
+print(f"Provinces with matched data: {province_merged_gdf['prov_code'].notna().sum()}")
+
+unmatched = province_merged_gdf[province_merged_gdf['prov_code'].isna()]
+if not unmatched.empty:
+    print(f"Provinces without data: {unmatched['pr_name'].tolist()}")
+
+display(province_merged_gdf.head())
+```
+
+```{python}
+graph_dir = os.path.join(Path, "Graph")
+os.makedirs(graph_dir, exist_ok=True)
+
+if 'geometry_province' in province_merged_gdf.columns:
+    province_merged_gdf = province_merged_gdf.set_geometry('geometry_province')
+
+missing_style = {'color': '#e0e0e0', 'edgecolor': 'white', 'hatch': '///'}
+
+so2_cols = ['so2_reduction_target_11th_fyp', 'so2_reduction_rate_11th_fyp']
+valid_so2_cols = [c for c in so2_cols if c in province_merged_gdf.columns]
+
+for c in valid_so2_cols:
+    province_merged_gdf[c] = province_merged_gdf[c] * 100
+
+if valid_so2_cols:
+    vmin_so2 = province_merged_gdf[valid_so2_cols].min().min()
+    vmax_so2 = province_merged_gdf[valid_so2_cols].max().max()
+else:
+    vmin_so2, vmax_so2 = 0, 100
+
+fig1, axes1 = plt.subplots(1, 2, figsize=(16, 7))
+fig1.suptitle("Province-level SO2 Reduction (11th FYP)", fontsize=20, fontweight='bold', y=1.02)
+
+so2_configs = [
+    {'col': 'so2_reduction_target_11th_fyp', 'title': 'Target Reduction Rate'},
+    {'col': 'so2_reduction_rate_11th_fyp', 'title': 'Actual Reduction Rate'}
+]
+
+for i, config in enumerate(so2_configs):
+    ax = axes1[i]
+    col = config['col']
+    if col in province_merged_gdf.columns:
+        province_merged_gdf.plot(
+            column=col, cmap='YlOrRd', linewidth=0.6, edgecolor='black', 
+            vmin=vmin_so2, vmax=vmax_so2, 
+            legend=True, 
+            legend_kwds={
+                'orientation': 'horizontal', 
+                'fraction': 0.046, 
+                'pad': 0.04,
+                'format': '%.1f%%',         
+                'label': 'Percentage (%)'   
+            },
+            missing_kwds=missing_style, ax=ax
+        )
+    ax.set_title(config['title'], fontsize=16, fontweight='bold', pad=10)
+    ax.set_axis_off()
+
+plt.tight_layout()
+fig1_path = os.path.join(graph_dir, "SO2_Reduction.png")
+fig1.savefig(fig1_path, dpi=300, bbox_inches='tight')
+print(f"Saved: {fig1_path}")
+plt.show()
+
+
+shared_cols = ['exit_count', 'entry_count']
+valid_shared_cols = [c for c in shared_cols if c in province_merged_gdf.columns]
+
+if valid_shared_cols:
+    vmin_shared = province_merged_gdf[valid_shared_cols].min().min()
+    vmax_shared = province_merged_gdf[valid_shared_cols].max().max()
+else:
+    vmin_shared, vmax_shared = 0, 1
+
+fig2 = plt.figure(figsize=(16, 16))
+fig2.suptitle("Firm Dynamics", fontsize=20, fontweight='bold', y=1.02)
+
+gs = fig2.add_gridspec(2, 2, height_ratios=[1.2, 1])
+
+ax0 = fig2.add_subplot(gs[0, :])
+ax1 = fig2.add_subplot(gs[1, 0])
+ax2 = fig2.add_subplot(gs[1, 1])
+
+dynamic_configs = [
+    {
+        'ax': ax0, 'col': 'migrate_count', 'title': 'Migrating Firms', 'fontsize': 18, 
+        'cmap': 'PuRd', 
+        'vmin': province_merged_gdf['migrate_count'].min() if 'migrate_count' in province_merged_gdf.columns else 0,
+        'vmax': province_merged_gdf['migrate_count'].max() if 'migrate_count' in province_merged_gdf.columns else 1
+    },
+    {
+        'ax': ax1, 'col': 'exit_count', 'title': 'Exiting Firms', 'fontsize': 16, 
+        'cmap': 'YlGnBu', 'vmin': vmin_shared, 'vmax': vmax_shared
+    },
+    {
+        'ax': ax2, 'col': 'entry_count', 'title': 'Entering Firms', 'fontsize': 16, 
+        'cmap': 'YlGnBu', 'vmin': vmin_shared, 'vmax': vmax_shared
+    }
+]
+
+for pdx, config in enumerate(dynamic_configs):
+    ax = config['ax']
+    col = config['col']
+    if col in province_merged_gdf.columns:
+        province_merged_gdf.plot(
+            column=col, cmap=config['cmap'], linewidth=0.6, edgecolor='black',
+            vmin=config['vmin'], vmax=config['vmax'], 
+            legend=True, legend_kwds={'orientation': 'horizontal', 'fraction': 0.046, 'pad': 0.04},
+            missing_kwds=missing_style, ax=ax
+        )
+    ax.set_title(config['title'], fontsize=config['fontsize'], fontweight='bold', pad=10)
+    ax.set_axis_off()
+
+plt.tight_layout()
+fig2_path = os.path.join(graph_dir, "Firm_Dynamics.png")
+fig2.savefig(fig2_path, dpi=300, bbox_inches='tight')
+print(f"Saved: {fig2_path}")
+plt.show()
+```
+
+```{python}
+code_mapping = {
+    110100: 110000, 
+    120100: 120000, 
+    310100: 310000, 
+    500100: 500000, 
+    500200: 500000  
+}
+
+name_mapping = {
+    110000: '北京市',
+    120000: '天津市',
+    310000: '上海市',
+    500000: '重庆市'
+}
+
+city_gdf_clean = city_gdf.copy()
+
+city_gdf_clean['ct_adcode'] = city_gdf_clean['ct_adcode'].replace(code_mapping)
+
+city_gdf_clean['ct_name'] = city_gdf_clean['ct_adcode'].map(name_mapping).fillna(city_gdf_clean['ct_name'])
+
+city_gdf_clean = city_gdf_clean.dissolve(by='ct_adcode', as_index=False)
+
+city_gdf_clean = city_gdf_clean.set_geometry('geometry_city')
+```
+
+```{python}
+final_data['city_code'] = final_data['city_code'].astype('Int64')
+
+city_env_raw_path = os.path.join(Path, "地级市工业三废数据 2003-2023年.xlsx")
+city_env_raw = pd.read_excel(city_env_raw_path, sheet_name='线性插值')
+
+city_env_raw.columns = city_env_raw.columns.str.replace('\n', '', regex=False).str.replace(' ', '', regex=False)
+
+rename_dict = {
+    '城市代码': 'city_code',             
+    '年份': 'year',                      
+    '工业废水排放量(万吨)': 'industrial_wastewater_emission_10kton',
+    '工业二氧化硫排放量（吨）': 'industrial_so2_emission_ton',
+    '工业烟尘排放量（吨）': 'industrial_dust_emission_ton'
+}
+city_env_raw = city_env_raw.rename(columns=rename_dict)
+
+city_env_raw['city_code'] = pd.to_numeric(city_env_raw['city_code'], errors='coerce').astype('Int64')
+city_env_raw['year'] = pd.to_numeric(city_env_raw['year'], errors='coerce')
+
+emissions_cols = [
+    'industrial_wastewater_emission_10kton', 
+    'industrial_so2_emission_ton', 
+    'industrial_dust_emission_ton'
+]
+
+
+cols_to_merge = ['city_code', 'year'] + emissions_cols
+final_data = final_data.merge(city_env_raw[cols_to_merge], on=['city_code', 'year'], how='left')
+
+city_env = final_data.groupby(['city_code', 'year'])[emissions_cols].first().unstack('year')
+city_env.columns = [f"{col}_{year}" for col, year in city_env.columns]
+
+for col in emissions_cols:
+    val_05 = city_env.get(f"{col}_2005")
+    val_10 = city_env.get(f"{col}_2010")
+    if val_05 is not None and val_10 is not None:
+        city_env[f"{col}_reduction_rate_%"] = np.where(
+            val_05 > 0, (val_05 - val_10) / val_05 * 100, np.nan
+        )
+
+city_env = city_env.reset_index()
+
+city_dynamics = pd.DataFrame({'city_code': final_data['city_code'].dropna().unique()})
+
+if 'Exit' in final_data.columns:
+    exit_counts = final_data.groupby('city_code')['Exit'].sum().reset_index(name='exit_count')
+    city_dynamics = city_dynamics.merge(exit_counts, on='city_code', how='left')
+
+if 'Entry' in final_data.columns:
+    entry_counts = final_data.groupby('city_code')['Entry'].sum().reset_index(name='entry_count')
+    city_dynamics = city_dynamics.merge(entry_counts, on='city_code', how='left')
+
+if 'Migrate' in final_data.columns:
+    out_mig = final_data[final_data['year'] == 2005].groupby('city_code')['Migrate'].sum().reset_index(name='migrate_out_count')
+    in_mig = final_data[final_data['year'] == 2010].groupby('city_code')['Migrate'].sum().reset_index(name='migrate_in_count')
+    
+    city_dynamics = city_dynamics.merge(out_mig, on='city_code', how='left')
+    city_dynamics = city_dynamics.merge(in_mig, on='city_code', how='left')
+
+dynamic_cols = [c for c in city_dynamics.columns if c != 'city_code']
+city_dynamics[dynamic_cols] = city_dynamics[dynamic_cols].fillna(0)
+
+if 'migrate_in_count' in city_dynamics.columns and 'migrate_out_count' in city_dynamics.columns:
+    city_dynamics['net_migration'] = city_dynamics['migrate_in_count'] - city_dynamics['migrate_out_count']
+
+    conditions = [
+        city_dynamics['net_migration'] > 0,
+        city_dynamics['net_migration'] < 0
+    ]
+    choices = [1, -1]
+    city_dynamics['net_migration_dummy'] = np.select(conditions, choices, default=0)
+
+city_df = city_env.merge(city_dynamics, on='city_code', how='outer')
+
+if 'city_gdf_clean' in globals():
+    city_merged_gdf = city_gdf_clean.merge(
+        city_df, 
+        left_on='ct_adcode', 
+        right_on='city_code', 
+        how='left'
+    )
+    city_merged_gdf = city_merged_gdf.set_geometry('geometry_city')
+
+    display_cols = ['ct_name', 'migrate_in_count', 'migrate_out_count', 'net_migration', 'net_migration_dummy', 'industrial_so2_emission_ton_reduction_rate_%']
+    display_cols = [c for c in display_cols if c in city_merged_gdf.columns]
+    display(city_merged_gdf[display_cols].head(10))
+```
+
+```{python}
+graph_dir = os.path.join(Path, "Graph")
+os.makedirs(graph_dir, exist_ok=True)
+
+if 'geometry_city' in city_merged_gdf.columns:
+    city_merged_gdf = city_merged_gdf.set_geometry('geometry_city')
+
+missing_style = {'color': '#e0e0e0', 'edgecolor': 'white', 'hatch': '///'}
+
+reduction_cols = [
+    'industrial_so2_emission_ton_reduction_rate_%',
+    'industrial_dust_emission_ton_reduction_rate_%',
+    'industrial_wastewater_emission_10kton_reduction_rate_%'
+]
+
+vmin_val = -100
+vmax_val = 100
+
+fig = plt.figure(figsize=(16, 16))
+fig.suptitle("City-level Emission Reduction Rate", fontsize=22, fontweight='bold', y=1.02)
+gs = fig.add_gridspec(2, 2, height_ratios=[1.2, 1])
+
+ax0 = fig.add_subplot(gs[0, :]) 
+ax1 = fig.add_subplot(gs[1, 0]) 
+ax2 = fig.add_subplot(gs[1, 1]) 
+
+plot_configs = [
+    {'ax': ax0, 'col': reduction_cols[0], 'title': 'SO2 Emission Reduction', 'fontsize': 18},
+    {'ax': ax1, 'col': reduction_cols[1], 'title': 'Industrial Dust Reduction', 'fontsize': 16},
+    {'ax': ax2, 'col': reduction_cols[2], 'title': 'Wastewater Reduction', 'fontsize': 16}
+]
+
+for config in plot_configs:
+    ax = config['ax']
+    col = config['col']
+    
+    if col in city_merged_gdf.columns:
+        city_merged_gdf.plot(
+            column=col, cmap='RdYlGn', linewidth=0.3, edgecolor='black', 
+            vmin=vmin_val, vmax=vmax_val,
+            legend=True, 
+            legend_kwds={
+                'orientation': 'horizontal', 
+                'fraction': 0.046, 
+                'pad': 0.04,
+                'format': '%.0f%%',     
+                'label': 'Reduction Rate (%)'
+            },
+            missing_kwds=missing_style, ax=ax
+        )
+    ax.set_title(config['title'], fontsize=config['fontsize'], fontweight='bold', pad=10)
+    ax.set_axis_off()
+
+plt.tight_layout()
+
+fig_path = os.path.join(graph_dir, "City_Emission_Reduction.png")
+fig.savefig(fig_path, dpi=300, bbox_inches='tight')
+print(f"Saved: {fig_path}")
+plt.show()
+```
+
+```{python}
+city_merged_gdf['align_dummy'] = 4
+
+c1 = (
+    (city_merged_gdf[reduction_cols[0]] > 0) & 
+    (city_merged_gdf[reduction_cols[1]] > 0) & 
+    (city_merged_gdf[reduction_cols[2]] > 0)
+)
+
+c2 = (
+    (city_merged_gdf[reduction_cols[0]] > 0) & 
+    (city_merged_gdf[reduction_cols[1]] <= 0) & 
+    (city_merged_gdf[reduction_cols[2]] <= 0)
+)
+
+c3 = (city_merged_gdf[reduction_cols[0]] <= 0)
+
+city_merged_gdf.loc[c1, 'align_dummy'] = 1
+city_merged_gdf.loc[c2, 'align_dummy'] = 2
+city_merged_gdf.loc[c3, 'align_dummy'] = 3
+
+color_map = {
+    1: '#1a9850', 
+    2: '#4575b4',  
+    3: '#d73027', 
+    4: '#e0e0e0'   
+}
+city_merged_gdf['plot_color'] = city_merged_gdf['align_dummy'].map(color_map)
+
+fig_aligned, ax_aligned = plt.subplots(1, 1, figsize=(12, 10))
+
+city_merged_gdf.plot(
+    color=city_merged_gdf['plot_color'], 
+    linewidth=0.3, edgecolor='black',
+    ax=ax_aligned
+)
+
+ax_aligned.set_title("Emission Reduction Alignment Patterns", fontsize=18, fontweight='bold', pad=15)
+ax_aligned.set_axis_off()
+
+import matplotlib.patches as mpatches
+legend_elements = [
+    mpatches.Patch(color='#1a9850', label='All 3 Reduced'),
+    mpatches.Patch(color='#4575b4', label='Only SO2 Reduced'),
+    mpatches.Patch(color='#d73027', label='SO2 NOT Reduced'),
+    mpatches.Patch(color='#e0e0e0', label='Other / No Data')
+]
+
+ax_aligned.legend(handles=legend_elements, loc='lower right', fontsize=12)
+
+plt.tight_layout()
+
+fig_aligned_path = os.path.join(graph_dir, "City_Emission_Aligned_Multiclass.png")
+fig_aligned.savefig(fig_aligned_path, dpi=300, bbox_inches='tight')
+print(f"Saved: {fig_aligned_path}")
+plt.show()
+```
+
+```{python}
+firm_counts_05 = final_data[final_data['year'] == 2005].groupby('city_code').size()
+city_merged_gdf['firm_count_2005'] = city_merged_gdf['ct_adcode'].map(firm_counts_05)
+
+base_firms = city_merged_gdf['firm_count_2005'].replace(0, np.nan)
+
+city_merged_gdf['total_migrate_count'] = city_merged_gdf['migrate_in_count'].fillna(0) + city_merged_gdf['migrate_out_count'].fillna(0)
+base_firms = city_merged_gdf['firm_count_2005'].replace(0, np.nan)
+
+city_merged_gdf['total_migrate_count'] = city_merged_gdf['migrate_in_count'].fillna(0) + city_merged_gdf['migrate_out_count'].fillna(0)
+city_merged_gdf['migrate_rate'] = (city_merged_gdf['total_migrate_count'] / base_firms) * 100
+city_merged_gdf['exit_rate'] = (city_merged_gdf['exit_count'] / base_firms) * 100
+city_merged_gdf['entry_rate'] = (city_merged_gdf['entry_count'] / base_firms) * 100
+
+vmax_mig = city_merged_gdf['migrate_rate'].quantile(0.95)
+vmax_dyn = city_merged_gdf[['exit_rate', 'entry_rate']].quantile(0.95).max()
+
+fig_dyn = plt.figure(figsize=(16, 16))
+fig_dyn.suptitle("City-level Firm Dynamics (Rates)", fontsize=22, fontweight='bold', y=1.02)
+
+gs_dyn = fig_dyn.add_gridspec(2, 2, height_ratios=[1.2, 1])
+ax0_dyn = fig_dyn.add_subplot(gs_dyn[0, :])
+ax1_dyn = fig_dyn.add_subplot(gs_dyn[1, 0])
+ax2_dyn = fig_dyn.add_subplot(gs_dyn[1, 1])
+
+dyn_city_configs = [
+    {
+        'ax': ax0_dyn, 'col': 'migrate_rate', 'title': 'Migration Rate (%)', 'fontsize': 18, 
+        'cmap': 'PuRd', 'vmin': 0, 'vmax': vmax_mig
+    },
+    {
+        'ax': ax1_dyn, 'col': 'exit_rate', 'title': 'Exit Rate (%)', 'fontsize': 16, 
+        'cmap': 'YlGnBu', 'vmin': 0, 'vmax': vmax_dyn
+    },
+    {
+        'ax': ax2_dyn, 'col': 'entry_rate', 'title': 'Entry Rate (%)', 'fontsize': 16, 
+        'cmap': 'YlGnBu', 'vmin': 0, 'vmax': vmax_dyn
+    }
+]
+
+for config in dyn_city_configs:
+    ax = config['ax']
+    col = config['col']
+    if col in city_merged_gdf.columns:
+        city_merged_gdf.plot(
+            column=col, cmap=config['cmap'], linewidth=0.3, edgecolor='black',
+            vmin=config['vmin'], vmax=config['vmax'], 
+            legend=True, legend_kwds={
+                'orientation': 'horizontal', 'fraction': 0.046, 'pad': 0.04,
+                'format': '%.1f%%' 
+            },
+            missing_kwds=missing_style, ax=ax
+        )
+    ax.set_title(config['title'], fontsize=config['fontsize'], fontweight='bold', pad=10)
+    ax.set_axis_off()
+
+plt.tight_layout()
+fig_dyn_path = os.path.join(graph_dir, "City_Firm_Dynamics_Rates.png")
+fig_dyn.savefig(fig_dyn_path, dpi=300, bbox_inches='tight')
+print(f"Saved: {fig_dyn_path}")
+plt.show()
+
+color_map_nm = {
+    1: '#40a02b',   
+    -1: '#d73027', 
+    0: '#e0e0e0'    
+}
+city_merged_gdf['net_mig_color'] = city_merged_gdf['net_migration_dummy'].fillna(0).map(color_map_nm)
+
+so2_col = 'industrial_so2_emission_ton_reduction_rate_%'
+so2_median = city_merged_gdf[so2_col].median()
+print(f"SO2 Reduction Median: {so2_median:.2f}%")
+
+city_merged_gdf['so2_above_median_dummy'] = (city_merged_gdf[so2_col] > so2_median).astype(int)
+city_merged_gdf.loc[city_merged_gdf[so2_col].isna(), 'so2_above_median_dummy'] = 0
+
+color_map_so2 = {
+    1: '#40a02b',   
+    0: '#e0e0e0'    
+}
+city_merged_gdf['so2_color'] = city_merged_gdf['so2_above_median_dummy'].map(color_map_so2)
+
+fig_cmp, axes_cmp = plt.subplots(1, 2, figsize=(16, 7))
+fig_cmp.suptitle("Net Firm Migration vs. SO2 Reduction", fontsize=20, fontweight='bold', y=1.02)
+
+city_merged_gdf.plot(color=city_merged_gdf['net_mig_color'], linewidth=0.3, edgecolor='black', ax=axes_cmp[0])
+axes_cmp[0].set_title("Net Migration Status", fontsize=16, fontweight='bold', pad=10)
+axes_cmp[0].set_axis_off()
+
+legend_mig = [
+    mpatches.Patch(color='#40a02b', label='Net In-Migration'),
+    mpatches.Patch(color='#d73027', label='Net Out-Migration'),
+    mpatches.Patch(color='#e0e0e0', label='Zero / No Data')
+]
+axes_cmp[0].legend(handles=legend_mig, loc='lower right', fontsize=12)
+
+city_merged_gdf.plot(color=city_merged_gdf['so2_color'], linewidth=0.3, edgecolor='black', ax=axes_cmp[1])
+axes_cmp[1].set_title("SO2 Reduction", fontsize=16, fontweight='bold', pad=10)
+axes_cmp[1].set_axis_off()
+
+legend_so2 = [
+    mpatches.Patch(color='#40a02b', label=f'Above Median'),
+    mpatches.Patch(color='#e0e0e0', label='Below Median / No Data')
+]
+axes_cmp[1].legend(handles=legend_so2, loc='lower right', fontsize=12)
+
+plt.tight_layout()
+fig_cmp_path = os.path.join(graph_dir, "City_Migration_SO2Median_Compare.png")
+fig_cmp.savefig(fig_cmp_path, dpi=300, bbox_inches='tight')
+print(f"Saved: {fig_cmp_path}")
+plt.show()
+```
+
+```{python}
+code_col_in_gov = 'city_code' 
+score_col_in_gov = 'gov_score' 
+
+gov_df[code_col_in_gov] = gov_df[code_col_in_gov].astype('Int64')
+
+city_merged_gdf = city_merged_gdf.merge(
+    gov_df[[code_col_in_gov, score_col_in_gov]], 
+    left_on='ct_adcode', 
+    right_on=code_col_in_gov, 
+    how='left', 
+    suffixes=('', '_gov')
+)
+
+gov_median = city_merged_gdf[score_col_in_gov].median()
+city_merged_gdf['gov_above_median_dummy'] = (city_merged_gdf[score_col_in_gov] > gov_median).astype(int)
+city_merged_gdf.loc[city_merged_gdf[score_col_in_gov].isna(), 'gov_above_median_dummy'] = 0
+
+so2_col = 'industrial_so2_emission_ton_reduction_rate_%'
+so2_median = city_merged_gdf[so2_col].median()
+if 'so2_above_median_dummy' not in city_merged_gdf.columns:
+    city_merged_gdf['so2_above_median_dummy'] = (city_merged_gdf[so2_col] > so2_median).astype(int)
+    city_merged_gdf.loc[city_merged_gdf[so2_col].isna(), 'so2_above_median_dummy'] = 0
+
+city_merged_gdf['mig_dummy_clean'] = city_merged_gdf['net_migration_dummy'].fillna(0)
+
+triple_match = (
+    (city_merged_gdf['gov_above_median_dummy'] == 1) & 
+    (city_merged_gdf['so2_above_median_dummy'] == 1) & 
+    (city_merged_gdf['mig_dummy_clean'] == 1)
+)
+
+light_green = '#a1d99b'  
+dark_green = '#00441b'  
+grey_color = '#e0e0e0'  
+
+city_merged_gdf['gov_color'] = grey_color
+city_merged_gdf['so2_color'] = grey_color
+city_merged_gdf['mig_color'] = grey_color
+
+city_merged_gdf.loc[city_merged_gdf['gov_above_median_dummy'] == 1, 'gov_color'] = light_green
+city_merged_gdf.loc[city_merged_gdf['so2_above_median_dummy'] == 1, 'so2_color'] = light_green
+city_merged_gdf.loc[city_merged_gdf['mig_dummy_clean'] == 1, 'mig_color'] = light_green
+
+city_merged_gdf.loc[triple_match, 'gov_color'] = dark_green
+city_merged_gdf.loc[triple_match, 'so2_color'] = dark_green
+city_merged_gdf.loc[triple_match, 'mig_color'] = dark_green
+fig_gov, axes_gov = plt.subplots(1, 3, figsize=(20, 7))
+fig_gov.suptitle("Governance, SO2 Reduction, and Firm Migration Endogeneity", fontsize=24, fontweight='bold', y=1.05)
+
+
+city_merged_gdf.plot(color=city_merged_gdf['gov_color'], linewidth=0.3, edgecolor='black', ax=axes_gov[0])
+axes_gov[0].set_title(f"Governance Capacity", fontsize=18, fontweight='bold', pad=10)
+axes_gov[0].set_axis_off()
+
+city_merged_gdf.plot(color=city_merged_gdf['so2_color'], linewidth=0.3, edgecolor='black', ax=axes_gov[1])
+axes_gov[1].set_title(f"SO2 Reduction Rate", fontsize=18, fontweight='bold', pad=10)
+axes_gov[1].set_axis_off()
+
+city_merged_gdf.plot(color=city_merged_gdf['mig_color'], linewidth=0.3, edgecolor='black', ax=axes_gov[2])
+axes_gov[2].set_title(f"Net Firm In-Migration", fontsize=18, fontweight='bold', pad=10)
+axes_gov[2].set_axis_off()
+
+common_legend = [
+    mpatches.Patch(color=dark_green, label='Satisfies ALL 3 Conditions'),
+    mpatches.Patch(color=light_green, label='Above Median / Net In-Migration'),
+    mpatches.Patch(color=grey_color, label='Below / Net Out / No Data')
+]
+
+for ax in axes_gov:
+    ax.legend(handles=common_legend, loc='lower right', fontsize=12)
+
+plt.tight_layout(w_pad=0.2)
+
+fig_gov_path = os.path.join(Path, "Graph", "City_Gov_SO2_Mig_TripleMatch.png")
+fig_gov.savefig(fig_gov_path, dpi=300, bbox_inches='tight')
+print(f"Saved: {fig_gov_path}")
+plt.show()
+```
+
+```{python}
+district_gdf['dt_adcode'] = district_gdf['dt_adcode'].astype('Int64')
+final_data['county_code'] = final_data['county_code'].astype('Int64')
+final_gdf = final_data.merge(
+    district_gdf[['dt_adcode', 'geometry_district', 'dt_name']], 
+    left_on='county_code', 
+    right_on='dt_adcode', 
+    how='left'
+)
+county_gdf = gpd.GeoDataFrame(final_gdf, geometry='geometry_district', crs=district_gdf.crs)
+county_gdf = county_gdf.dropna(subset=['geometry_district'])
+```
+
+```{python}
+county_gdf['county_lon'] = pd.to_numeric(county_gdf['county_lon'], errors='coerce')
+county_gdf['county_lat'] = pd.to_numeric(county_gdf['county_lat'], errors='coerce')
+
+county_gdf['geometry_point'] = gpd.points_from_xy(county_gdf['county_lon'], county_gdf['county_lat'])
+
+county_gdf = county_gdf.set_geometry('geometry_point')
+county_gdf = county_gdf.set_crs(epsg=4326, allow_override=True)
+
+print("转化成功！新的地理坐标点并且已设为激活几何列 'geometry_point'：")
+if 'county_name' in county_gdf.columns:
+    display(county_gdf[['county_name', 'county_lon', 'county_lat', 'geometry_point']].head())
+else:
+    display(county_gdf[['county_lon', 'county_lat', 'geometry_point']].head())
+```
+
+```{python}
+county_gdf['city_code'] = county_gdf['city_code'].astype('Int64')
+
+target_col = 'industrial_so2_emission_ton_reduction_rate_%'
+
+cols_to_drop = [target_col, f"{target_col}_x", f"{target_col}_y"]
+existing_cols_to_drop = [c for c in cols_to_drop if c in county_gdf.columns]
+if existing_cols_to_drop:
+    county_gdf = county_gdf.drop(columns=existing_cols_to_drop)
+
+city_so2_data = pd.DataFrame(city_merged_gdf.drop(columns='geometry_city'))
+cols_to_merge = ['city_code', target_col]
+
+city_so2_clean = city_so2_data[cols_to_merge].drop_duplicates(subset=['city_code'])
+
+county_gdf = county_gdf.merge(
+    city_so2_clean,
+    on='city_code',
+    how='left'
+)
+```
+
+```{python}
+output_dir = "Output_Maps_Policy"
+os.makedirs(output_dir, exist_ok=True)
+
+regions_dict = {
+    'Beijing-Tianjin-Hebei': [11, 12, 13], 
+    'Greater East': [31, 32, 33, 34, 37], 
+    'Hunan-Hubei-Jiangxi': [43, 42, 36]                     
+}
+
+if 'geometry' in county_gdf.columns:
+    attr_df = pd.DataFrame(county_gdf.drop(columns=['geometry']))
+else:
+    attr_df = pd.DataFrame(county_gdf)
+
+attr_df = attr_df.drop_duplicates(subset=['county_code']).copy()
+attr_df['prov_clean'] = (pd.to_numeric(attr_df['county_code'], errors='coerce').fillna(0) // 10000).astype(int)
+
+geom_col = district_gdf.geometry.name
+poly_base = district_gdf[['dt_adcode', geom_col]].copy()
+if geom_col != 'geometry':
+    poly_base = poly_base.rename_geometry('geometry')
+
+poly_base['dt_adcode'] = pd.to_numeric(poly_base['dt_adcode'], errors='coerce').fillna(0).astype('Int64')
+attr_df['county_code'] = pd.to_numeric(attr_df['county_code'], errors='coerce').fillna(0).astype('Int64')
+
+all_counties = poly_base.merge(attr_df, left_on='dt_adcode', right_on='county_code', how='inner')
+
+all_counties = all_counties[all_counties['prov_clean'] > 0]
+all_counties = all_counties.set_geometry('geometry')
+all_counties = all_counties.to_crs(epsg=3857)
+all_counties['is_border_county'] = all_counties['is_border_county'].fillna(False).astype(bool)
+
+so2_col = 'industrial_so2_emission_ton_reduction_rate_%'
+
+def draw_policy_map(plot_gdf, title_name, fig_size=(16, 14), save_filename=None):
+    fig, ax = plt.subplots(1, 1, figsize=fig_size)
+    ax.set_title(f"SO2 Reduction Pressure Comparison ({title_name})", 
+                 fontsize=26, fontweight='bold', pad=25)
+    
+    plot_gdf[~plot_gdf['is_border_county']].plot(ax=ax, color='#f0f0f0', edgecolor='#ffffff', linewidth=0.5, zorder=1)
+
+    border_gdf = plot_gdf[plot_gdf['is_border_county']].copy()
+    if not border_gdf.empty and so2_col in border_gdf.columns:
+        border_gdf[so2_col] = pd.to_numeric(border_gdf[so2_col], errors='coerce')
+        border_gdf.plot(
+            ax=ax, column=so2_col, cmap='OrRd', edgecolor='#525252', linewidth=0.8,
+            vmin=0, vmax=60, 
+            missing_kwds={'color': '#d9d9d9'}, zorder=2,
+            legend=True, 
+            legend_kwds={'shrink': 0.5, 'label': 'SO2 Reduction (%)', 'pad': 0.02}
+        )
+
+    try:
+        prov_boundaries = plot_gdf.dissolve(by='prov_clean')
+        prov_boundaries.boundary.plot(ax=ax, color='#252525', linewidth=2.0, zorder=3)
+    except:
+        pass
+
+    ax.set_axis_off()
+
+    legend_elements = [
+        mpatches.Patch(color='#f0f0f0', label='Inland Counties'),
+        plt.Line2D([0], [0], color='#252525', linewidth=2.5, label='Provincial Boundaries')
+    ]
+    ax.legend(handles=legend_elements, loc='lower right', fontsize=15, framealpha=0.95)
+
+    plt.tight_layout()
+    
+    if save_filename:
+        save_path = os.path.join(output_dir, f"{save_filename}.png")
+        fig.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved HD image: {save_path}")
+        
+    plt.show()
+
+print("\n--- Generating National Policy Overview Map ---")
+draw_policy_map(all_counties, "National Overview", fig_size=(18, 14), save_filename="0_National_Policy_Overview")
+
+print("\n--- Generating Focus Region Maps ---")
+for i, (region_name, prov_list) in enumerate(regions_dict.items(), 1):
+    region_gdf = all_counties[all_counties['prov_clean'].isin(prov_list)].copy()
+    if not region_gdf.empty:
+        safe_name = region_name.split(" ")[0].replace("-", "_")
+        draw_policy_map(region_gdf, region_name, fig_size=(14, 14), save_filename=f"{i}_Focus_{safe_name}")
+```
+
+```{python}
+alt.data_transformers.disable_max_rows()
+output_dir = "graph"
+os.makedirs(output_dir, exist_ok=True)
+
+emis_df = final_data[['year', 'so2_emission']].copy()
+emis_df['so2_emission'] = pd.to_numeric(emis_df['so2_emission'], errors='coerce')
+emis_df = emis_df.dropna(subset=['so2_emission'])
+emis_df = emis_df[emis_df['year'].isin([2005, 2010])]
+
+mean_emis = emis_df.groupby('year')['so2_emission'].mean().reset_index()
+mean_emis['Year'] = mean_emis['year'].astype(str)
+
+bars = alt.Chart(mean_emis).mark_bar(size=80).encode(
+    x=alt.X('Year:N', title='Year', axis=alt.Axis(labelAngle=0, labelFontSize=16, titleFontSize=14)),
+    y=alt.Y('so2_emission:Q', title='Average SO2 Emission per Firm (KGs)', axis=alt.Axis(labelFontSize=13, titleFontSize=14)),
+    color=alt.condition(alt.datum.year == 2005, alt.value('#e41a1c'), alt.value('#4daf4a')),
+)
+
+text_b = bars.mark_text(align='center', baseline='bottom', dy=-8, fontSize=18, fontWeight='bold', color='black').encode(
+    text=alt.Text('so2_emission:Q', format='.2f')
+)
+
+bar_chart = (bars + text_b).properties(
+    title=alt.TitleParams('Firm-Level SO2 Emission', fontSize=20, offset=20, anchor='middle'),
+    width=400, height=400
+).configure_view(strokeOpacity=0).configure_axis(grid=False)
+
+display(bar_chart)
+
+ind_col = 'industry_category'      
+own_col = 'Firm_Type'              
+
+x_order = ['Electricity, Gas, Steam and Water Supply', 'Manufacturing', 'Mining and Quarrying']
+y_order = ['State-owned', 'Private', 'Foreign'] 
+
+cols_to_keep = ['firm_id', 'year', 'so2_emission']
+if ind_col in final_data.columns: cols_to_keep.append(ind_col)
+if own_col in final_data.columns: cols_to_keep.append(own_col)
+
+df_base = final_data[list(set(cols_to_keep))].dropna(subset=['firm_id', 'so2_emission']).copy()
+df_base['so2_emission'] = pd.to_numeric(df_base['so2_emission'], errors='coerce')
+
+df_05 = df_base[df_base['year'] == 2005].copy()
+df_10 = df_base[df_base['year'] == 2010][['firm_id', 'so2_emission']].copy()
+merge_df = df_05.merge(df_10, on='firm_id', suffixes=('_05', '_10'), how='inner')
+
+merge_df['reduction_rate'] = ((merge_df['so2_emission_05'] - merge_df['so2_emission_10']) / merge_df['so2_emission_05']) * 100
+merge_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+merge_df = merge_df[(merge_df['reduction_rate'] >= -200) & (merge_df['reduction_rate'] <= 100)]
+
+if ind_col in merge_df.columns:
+    merge_df[ind_col] = merge_df[ind_col].astype(str).str.strip()
+    merge_df = merge_df[merge_df[ind_col].isin(x_order)]
+if own_col in merge_df.columns:
+    merge_df[own_col] = merge_df[own_col].astype(str).str.strip()
+    merge_df = merge_df[merge_df[own_col].isin(y_order)]
+
+group_stats = merge_df.groupby([ind_col, own_col])['reduction_rate'].mean().reset_index()
+
+base_h = alt.Chart(group_stats).encode(
+    x=alt.X(f'{ind_col}:N', title='Industry Sector', scale=alt.Scale(domain=x_order), axis=alt.Axis(labelAngle=-15, labelFontSize=13, titlePadding=15)),
+    y=alt.Y(f'{own_col}:N', title='Firm Ownership', scale=alt.Scale(domain=y_order), axis=alt.Axis(labelFontSize=14, titlePadding=15))
+)
+
+heatmap = base_h.mark_rect().encode(
+    color=alt.Color('reduction_rate:Q', scale=alt.Scale(scheme='redyellowgreen', domain=[-50, 50]), title='Avg Reduction Rate (%)')
+)
+
+text_h = base_h.mark_text(baseline='middle', fontSize=18, fontWeight='bold').encode(
+    text=alt.Text('reduction_rate:Q', format='.1f'),
+    color=alt.condition((alt.datum.reduction_rate > 30) | (alt.datum.reduction_rate < -30), alt.value('white'), alt.value('black'))
+)
+
+heatmap_chart = (heatmap + text_h).properties(
+    title=alt.TitleParams('Firm Heterogeneity in SO2 Reduction', fontSize=24, offset=25, anchor='start'),
+    width=650, height=350
+).configure_view(strokeWidth=0)
+
+display(heatmap_chart)
+
+try:
+    bar_chart.save(os.path.join(output_dir, "1_Firm_Level_SO2_BarChart.png"), scale_factor=2.0)
+    heatmap_chart.save(os.path.join(output_dir, "2_Firm_Level_Reduction_Heatmap.png"), scale_factor=2.0)
+except Exception as e:
+    bar_chart.save(os.path.join(output_dir, "1_Firm_Level_SO2_BarChart.html"))
+    heatmap_chart.save(os.path.join(output_dir, "2_Firm_Level_Reduction_Heatmap.html"))
+```
+
+```{python}
+alt.data_transformers.disable_max_rows()
+output_dir = "graph"
+os.makedirs(output_dir, exist_ok=True)
+df_base = final_data[['firm_id', 'year', 'county_code', 'so2_emission']].copy()
+df_base['so2_emission'] = pd.to_numeric(df_base['so2_emission'], errors='coerce')
+df_base['county_code'] = pd.to_numeric(df_base['county_code'], errors='coerce').astype('Int64')
+df_base = df_base.dropna(subset=['firm_id', 'so2_emission', 'county_code'])
+
+df_05 = df_base[df_base['year'] == 2005].copy()
+df_10 = df_base[df_base['year'] == 2010][['firm_id', 'so2_emission']].copy()
+
+merge_df = df_05.merge(df_10, on='firm_id', suffixes=('_05', '_10'), how='inner')
+
+merge_df['reduction_rate'] = ((merge_df['so2_emission_05'] - merge_df['so2_emission_10']) / merge_df['so2_emission_05']) * 100
+
+merge_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+merge_df = merge_df[(merge_df['reduction_rate'] >= -200) & (merge_df['reduction_rate'] <= 100)]
+
+mapping_df = all_counties[['county_code', 'is_border_county']].copy()
+mapping_df['county_code'] = pd.to_numeric(mapping_df['county_code'], errors='coerce').astype('Int64')
+
+final_stats = merge_df.merge(mapping_df, on='county_code', how='inner')
+
+final_stats['Location'] = final_stats['is_border_county'].map({True: 'Border Counties', False: 'Inland (Non-Border)'})
+
+agg_df = final_stats.groupby('Location')['reduction_rate'].mean().reset_index()
+agg_df.rename(columns={'reduction_rate': 'Average Reduction Rate (%)'}, inplace=True)
+
+bars = alt.Chart(agg_df).mark_bar(size=100).encode(
+    x=alt.X('Location:N', title=None, axis=alt.Axis(labelAngle=0, labelFontSize=16, labelFontWeight='bold')),
+    y=alt.Y('Average Reduction Rate (%):Q', title='Average Enterprise SO2 Reduction Rate (%)', 
+            axis=alt.Axis(labelFontSize=14, titleFontSize=15, titlePadding=15)),
+    color=alt.Color('Location:N', scale=alt.Scale(domain=['Inland (Non-Border)', 'Border Counties'], 
+                                                  range=['#7570b3', '#d95f02']), legend=None)
+)
+
+text = bars.mark_text(
+    align='center', 
+    baseline='bottom', 
+    dy=-8, 
+    fontSize=20, 
+    fontWeight='bold'
+).encode(
+    text=alt.Text('Average Reduction Rate (%):Q', format='.2f')
+)
+
+chart = (bars + text).properties(
+    title=alt.TitleParams('Firm-Level SO2 Reduction Effort: Border vs. Inland', 
+                          fontSize=22, offset=25, anchor='middle'),
+    width=450, 
+    height=400
+).configure_view(
+    strokeOpacity=0
+).configure_axis(
+    grid=False
+)
+
+display(chart)
+
+try:
+    chart.save(os.path.join(output_dir, "3_Firm_Level_Reduction_Border_vs_Inland.png"), scale_factor=2.0)
+except Exception as e:
+    chart.save(os.path.join(output_dir, "3_Firm_Level_Reduction_Border_vs_Inland.html"))
+```
+
+```{python}
+alt.data_transformers.disable_max_rows()
+
+print("正在计算不同行业与企业性质的迁移率热力图...")
+
+output_dir = "graph"
+os.makedirs(output_dir, exist_ok=True)
+
+ind_col = 'industry_category'      
+own_col = 'Firm_Type'              
+
+x_order = ['Electricity, Gas, Steam and Water Supply', 'Manufacturing', 'Mining and Quarrying']
+y_order = ['State-owned', 'Private', 'Foreign'] 
+
+df_mig = final_data[['firm_id', 'year', 'county_code']].dropna().copy()
+df_mig['county_code'] = pd.to_numeric(df_mig['county_code'], errors='coerce').astype('Int64')
+
+df_05_loc = df_mig[df_mig['year'] == 2005].rename(columns={'county_code': 'county_05'})
+df_10_loc = df_mig[df_mig['year'] == 2010].rename(columns={'county_code': 'county_10'})
+
+mig_status = pd.merge(df_05_loc[['firm_id', 'county_05']], df_10_loc[['firm_id', 'county_10']], on='firm_id', how='inner')
+mig_status['is_migrated'] = mig_status['county_05'] != mig_status['county_10']
+
+traits_df = final_data[final_data['year'] == 2005][['firm_id', ind_col, own_col]].copy()
+traits_df = traits_df.dropna(subset=[ind_col, own_col])
+
+traits_df[ind_col] = traits_df[ind_col].astype(str).str.strip()
+traits_df[own_col] = traits_df[own_col].astype(str).str.strip()
+
+traits_df = traits_df[traits_df[ind_col].isin(x_order)]
+traits_df = traits_df[traits_df[own_col].isin(y_order)]
+
+heatmap_df = pd.merge(mig_status[['firm_id', 'is_migrated']], traits_df, on='firm_id', how='inner')
+
+group_mig_rate = heatmap_df.groupby([ind_col, own_col])['is_migrated'].mean().reset_index()
+group_mig_rate['migration_rate'] = group_mig_rate['is_migrated'] * 100
+
+base_h = alt.Chart(group_mig_rate).encode(
+    x=alt.X(f'{ind_col}:N', title='Industry Sector', 
+            scale=alt.Scale(domain=x_order), 
+            axis=alt.Axis(labelAngle=-15, labelFontSize=13, titlePadding=15)),
+    y=alt.Y(f'{own_col}:N', title='Firm Ownership', 
+            scale=alt.Scale(domain=y_order), 
+            axis=alt.Axis(labelFontSize=14, titlePadding=15))
+)
+
+heatmap = base_h.mark_rect().encode(
+    color=alt.Color('migration_rate:Q', 
+                    scale=alt.Scale(scheme='oranges'), 
+                    title='Migration Rate (%)')
+)
+
+text_h = base_h.mark_text(baseline='middle', fontSize=18, fontWeight='bold').encode(
+    text=alt.Text('migration_rate:Q', format='.2f'),
+    color=alt.condition(alt.datum.migration_rate > group_mig_rate['migration_rate'].quantile(0.6), 
+                        alt.value('white'), 
+                        alt.value('black'))
+)
+
+heatmap_chart = (heatmap + text_h).properties(
+    title=alt.TitleParams('Firm Migration Rate by Industry & Ownership', fontSize=24, offset=25, anchor='start'),
+    width=600, height=350
+).configure_view(strokeWidth=0)
+
+display(heatmap_chart)
+
+try:
+    heatmap_chart.save(os.path.join(output_dir, "7_Firm_Migration_Heatmap.png"), scale_factor=2.0)
+except Exception as e:
+    heatmap_chart.save(os.path.join(output_dir, "7_Firm_Migration_Heatmap.html"))
+```
+
+```{python}
+output_dir = "graph"
+os.makedirs(output_dir, exist_ok=True)
+
+df_emis = final_data[['year', 'county_code', 'so2_emission']].copy()
+df_emis['county_code'] = pd.to_numeric(df_emis['county_code'], errors='coerce').astype('Int64')
+df_emis['so2_emission'] = pd.to_numeric(df_emis['so2_emission'], errors='coerce')
+df_emis = df_emis.dropna()
+df_emis = df_emis[df_emis['so2_emission'] >= 0]
+
+c_emis = df_emis[df_emis['year'].isin([2005, 2010])].groupby(['county_code', 'year'])['so2_emission'].sum().unstack()
+c_emis = c_emis.dropna(subset=[2005, 2010])
+
+c_emis['county_reduction_rate'] = ((c_emis[2005] - c_emis[2010]) / c_emis[2005]) * 100
+c_emis = c_emis.replace([np.inf, -np.inf], np.nan).dropna(subset=['county_reduction_rate'])
+
+c_emis['county_reduction_rate'] = np.clip(c_emis['county_reduction_rate'], -100, 100)
+
+df_loc = final_data[['firm_id', 'year', 'county_code']].dropna().copy()
+df_loc['county_code'] = pd.to_numeric(df_loc['county_code'], errors='coerce').astype('Int64')
+
+df_05 = df_loc[df_loc['year'] == 2005].rename(columns={'county_code': 'county_05'})
+df_10 = df_loc[df_loc['year'] == 2010].rename(columns={'county_code': 'county_10'})
+
+migrants = pd.merge(df_05[['firm_id', 'county_05']], df_10[['firm_id', 'county_10']], on='firm_id')
+migrants = migrants[migrants['county_05'] != migrants['county_10']].copy()
+
+border_mapping = all_counties[['county_code', 'is_border_county']].copy()
+border_mapping['county_code'] = pd.to_numeric(border_mapping['county_code']).astype('Int64')
+border_dict = border_mapping.set_index('county_code')['is_border_county'].to_dict()
+
+migrants['border_05'] = migrants['county_05'].map(border_dict)
+migrants['border_10'] = migrants['county_10'].map(border_dict)
+migrants = migrants.dropna(subset=['border_05', 'border_10'])
+
+def get_migration_type(row):
+    if row['border_05'] and row['border_10']: return 'Border to Border'
+    if not row['border_05'] and row['border_10']: return 'Non-Border to Border'
+    if row['border_05'] and not row['border_10']: return 'Border to Non-Border'
+    if not row['border_05'] and not row['border_10']: return 'Non-Border to Non-Border'
+
+migrants['Mig_Type'] = migrants.apply(get_migration_type, axis=1)
+
+plot_df = migrants.merge(c_emis[['county_reduction_rate']], left_on='county_05', right_index=True, how='inner')
+
+plot_df['county_reduction_rate'] = plot_df['county_reduction_rate'] / 2
+
+type_baseline = 'Non-Border to Non-Border'
+df_baseline = plot_df[plot_df['Mig_Type'] == type_baseline].copy()
+df_stack = plot_df[plot_df['Mig_Type'] != type_baseline].copy()
+
+sns.set_theme(style="whitegrid")
+fig, ax = plt.subplots(figsize=(11, 6), dpi=130)
+
+hue_order_stack = [
+    'Border to Non-Border', 
+    'Border to Border', 
+    'Non-Border to Border'
+]
+palette_stack = {
+    'Non-Border to Border': '#d73027', 
+    'Border to Border': '#fc8d59',                     
+    'Border to Non-Border': '#fee090',                  
+}
+
+sns.kdeplot(
+    data=df_stack, 
+    x='county_reduction_rate', 
+    hue='Mig_Type', 
+    hue_order=hue_order_stack,
+    palette=palette_stack,
+    multiple="stack",   
+    fill=True, 
+    alpha=0.9, 
+    linewidth=0,       
+    bw_adjust=1.5,     
+    clip=(-50, 50),    
+    ax=ax,
+    legend=False
+)
+
+sns.kdeplot(
+    data=df_baseline, 
+    x='county_reduction_rate', 
+    color='#4575b4',  
+    fill=True, 
+    alpha=0.25,         
+    linewidth=2.5,      
+    bw_adjust=1.5,     
+    clip=(-50, 50),  
+    ax=ax,
+    legend=False
+)
+
+ax.set_title("Diverging Migration Trends: Migrating Firms' Type & Density", 
+             fontsize=16, fontweight='bold', pad=20)
+ax.set_xlabel("Origin County SO2 Reduction Rate (%)", 
+              fontsize=13, fontweight='bold', labelpad=10)
+ax.set_ylabel("Density", fontsize=13, fontweight='bold')
+
+leg_patches = [mpatches.Patch(color='#4575b4', alpha=0.3, label='Baseline: Non-Border to Non-Border')]
+for cat in reversed(hue_order_stack):  
+    leg_patches.append(mpatches.Patch(color=palette_stack[cat], alpha=0.9, label=f'Stacked: {cat}'))
+
+ax.legend(handles=leg_patches, loc='upper left', fontsize=11, frameon=True, shadow=True)
+
+ax.set_xlim(-52.5, 52.5)  
+sns.despine()
+
+plt.tight_layout()
+save_path = os.path.join(output_dir, "9_Mixed_Migration_Paths.png")
+plt.savefig(save_path, dpi=300, bbox_inches='tight')
+
+plt.show()
+```
+
+```{python}
+output_dir = "graph"
+os.makedirs(output_dir, exist_ok=True)
+vars_to_keep = ['firm_id', 'year', 'county_code', 'employment', 'profit', 'so2_emission']
+df_base = final_data[vars_to_keep].copy()
+
+df_base['county_code'] = pd.to_numeric(df_base['county_code'], errors='coerce').astype('Int64')
+for col in ['employment', 'profit', 'so2_emission']:
+    df_base[col] = pd.to_numeric(df_base[col], errors='coerce')
+
+df_05 = df_base[df_base['year'] == 2005].dropna(subset=['firm_id', 'county_code']).copy()
+df_10 = df_base[df_base['year'] == 2010].dropna(subset=['firm_id', 'county_code']).copy()
+df_emis = final_data[['year', 'county_code', 'so2_emission']].dropna().copy()
+df_emis['county_code'] = pd.to_numeric(df_emis['county_code'], errors='coerce').astype('Int64')
+df_emis['so2_emission'] = pd.to_numeric(df_emis['so2_emission'], errors='coerce')
+df_emis = df_emis[df_emis['so2_emission'] >= 0]
+
+c_emis = df_emis[df_emis['year'].isin([2005, 2010])].groupby(['county_code', 'year'])['so2_emission'].sum().unstack()
+c_emis = c_emis.dropna(subset=[2005, 2010])
+c_emis['county_reduction_rate'] = ((c_emis[2005] - c_emis[2010]) / c_emis[2005]) * 100
+c_emis['county_reduction_rate'] = np.clip(c_emis['county_reduction_rate'], -100, 100)
+county_rates = c_emis[['county_reduction_rate']].to_dict()['county_reduction_rate']
+
+firms_05 = set(df_05['firm_id'])
+firms_10 = set(df_10['firm_id'])
+
+exiting = df_05[~df_05['firm_id'].isin(firms_10)].copy()
+exiting['Status'] = 'Exiting'
+
+entering = df_10[~df_10['firm_id'].isin(firms_05)].copy()
+entering['Status'] = 'Entering'
+
+both_05 = df_05[df_05['firm_id'].isin(firms_10)].rename(columns={'county_code': 'county_05'})
+both_10 = df_10[df_10['firm_id'].isin(firms_05)][['firm_id', 'county_code']].rename(columns={'county_code': 'county_10'})
+
+both_merged = pd.merge(both_05, both_10, on='firm_id', how='inner')
+
+migrated = both_merged[both_merged['county_05'] != both_merged['county_10']].copy()
+migrated['Status'] = 'Migrated'
+migrated = migrated.rename(columns={'county_05': 'county_code'}) 
+stayed = both_merged[both_merged['county_05'] == both_merged['county_10']].copy()
+stayed['Status'] = 'Stayed'
+stayed = stayed.rename(columns={'county_05': 'county_code'})
+
+all_labels = ['Stayed', 'Migrated', 'Entering', 'Exiting']
+plot_df = pd.concat([
+    stayed[['Status', 'employment', 'profit', 'so2_emission', 'county_code']],
+    migrated[['Status', 'employment', 'profit', 'so2_emission', 'county_code']],
+    entering[['Status', 'employment', 'profit', 'so2_emission', 'county_code']],
+    exiting[['Status', 'employment', 'profit', 'so2_emission', 'county_code']]
+], ignore_index=True)
+
+plot_df['county_reduction_rate'] = plot_df['county_code'].map(county_rates)
+
+metrics = ['employment', 'profit', 'so2_emission', 'county_reduction_rate']
+titles = ['Employment', 'Profit', 'Firm SO2 Emission', "Origin County's Target Reduction Rate(%)"]
+
+palette = {
+    'Stayed': '#4daf4a',   
+    'Migrated': '#e41a1c', 
+    'Entering': '#377eb8', 
+    'Exiting': '#999999'   
+}
+
+sns.set_theme(style="whitegrid")
+fig, axes = plt.subplots(2, 2, figsize=(14, 12), dpi=120)
+axes = axes.flatten()
+
+for i, col in enumerate(metrics):
+    df_clean = plot_df.dropna(subset=[col]).copy()
+    
+    if col != 'county_reduction_rate':
+        p01 = df_clean[col].quantile(0.01)
+        p99 = df_clean[col].quantile(0.99)
+        df_clean = df_clean[(df_clean[col] >= p01) & (df_clean[col] <= p99)]
+    
+    ax_plot = sns.barplot(
+        data=df_clean, 
+        x='Status', 
+        y=col, 
+        hue='Status',
+        order=all_labels,
+        palette=palette, 
+        ax=axes[i],
+        errorbar=None,
+        edgecolor='black',
+        linewidth=1.5,
+        legend=False
+    )
+    
+    fmt = '%.1f' if col == 'county_reduction_rate' else '%.0f'
+    for container in ax_plot.containers:
+        ax_plot.bar_label(container, fmt=fmt, padding=4, fontsize=12, fontweight='bold', color='#222222')
+
+    axes[i].set_title(titles[i], fontsize=16, fontweight='bold', pad=15)
+    axes[i].set_xlabel("")
+    axes[i].set_ylabel("")
+    axes[i].tick_params(axis='x', labelsize=13)
+    
+    if col in ['employment', 'profit']:
+        axes[i].yaxis.set_major_formatter(plt.matplotlib.ticker.StrMethodFormatter('{x:,.0f}'))
+    
+    current_ylim = axes[i].get_ylim()
+    axes[i].set_ylim(0 if col != 'county_reduction_rate' else current_ylim[0], current_ylim[1] * 1.15)
+
+plt.suptitle("Firm Heterogeneity and Regulatory Pressure Across Dynamic Types", fontsize=22, fontweight='bold', y=1.02)
+plt.tight_layout()
+
+save_path = os.path.join(output_dir, "10_Firm_4Types_Dynamics_2x2.png")
+plt.savefig(save_path, dpi=300, bbox_inches='tight')
+
+plt.show()
+```
+
+```{python}
+output_dir = "graph"
+os.makedirs(output_dir, exist_ok=True)
+
+df_loc = final_data[['firm_id', 'year', 'county_code']].dropna().copy()
+df_loc['county_code'] = pd.to_numeric(df_loc['county_code'], errors='coerce').astype('Int64')
+
+df_05 = df_loc[df_loc['year'] == 2005].rename(columns={'county_code': 'county_05'})
+df_10 = df_loc[df_loc['year'] == 2010].rename(columns={'county_code': 'county_10'})
+
+mig_status = pd.merge(df_05[['firm_id', 'county_05']], df_10[['firm_id', 'county_10']], on='firm_id', how='inner')
+mig_status['is_migrated'] = mig_status['county_05'] != mig_status['county_10']
+
+border_mapping = all_counties[['county_code', 'is_border_county']].copy()
+border_mapping['county_code'] = pd.to_numeric(border_mapping['county_code']).astype('Int64')
+border_dict = border_mapping.set_index('county_code')['is_border_county'].to_dict()
+
+mig_status['is_border_05'] = mig_status['county_05'].map(border_dict)
+mig_status = mig_status.dropna(subset=['is_border_05'])
+
+mig_rates = mig_status.groupby('is_border_05')['is_migrated'].mean().reset_index()
+mig_rates['Migration Rate (%)'] = mig_rates['is_migrated'] * 100
+
+mig_rates['Origin County Type'] = mig_rates['is_border_05'].map({
+    False: 'Non-Border County', 
+    True: 'Border County'
+})
+
+print("各组的迁移率对比:\n", mig_rates[['Origin County Type', 'Migration Rate (%)']])
+
+sns.set_theme(style="whitegrid")
+fig, ax = plt.subplots(figsize=(7, 6), dpi=120)
+
+ax_plot = sns.barplot(
+    data=mig_rates, 
+    x='Origin County Type', 
+    y='Migration Rate (%)', 
+    hue='Origin County Type',
+    palette=['#4575b4', '#d73027'], 
+    edgecolor='black',
+    linewidth=1.5,
+    legend=False,
+    ax=ax
+)
+
+for container in ax_plot.containers:
+    ax_plot.bar_label(container, fmt='%.3f%%', padding=5, fontsize=14, fontweight='bold', color='#333333')
+
+ax.set_title("Firm Migration Rate: Border vs. Non-Border Origins", fontsize=16, fontweight='bold', pad=20)
+ax.set_xlabel("Firm Location", fontsize=14, fontweight='bold', labelpad=10)
+ax.set_ylabel("Average Migration Rate (%)", fontsize=14, fontweight='bold')
+
+current_ylim = ax.get_ylim()
+ax.set_ylim(0, current_ylim[1] * 1.15)
+ax.tick_params(axis='x', labelsize=13)
+ax.tick_params(axis='y', labelsize=12)
+
+sns.despine()
+
+plt.tight_layout()
+
+save_path = os.path.join(output_dir, "11_Migration_Rate_Border_vs_NonBorder.png")
+plt.savefig(save_path, dpi=300, bbox_inches='tight')
+
+plt.show()
+```
+
+```{python}
+output_data_dir = os.path.join(Path, "data")
+os.makedirs(output_data_dir, exist_ok=True)
+
+df_base = final_data[['firm_id', 'year', 'county_code', 'so2_emission']].copy()
+df_base = df_base.dropna(subset=['firm_id', 'year', 'county_code'])
+
+df_base['county_code'] = pd.to_numeric(df_base['county_code'], errors='coerce').astype('Int64')
+df_base['city_code'] = df_base['county_code'] // 100
+df_base['prov_code'] = df_base['county_code'] // 10000
+df_base['so2_emission'] = pd.to_numeric(df_base['so2_emission'], errors='coerce')
+
+def calculate_regional_metrics(df, geo_col):
+    emis = df[df['so2_emission'] >= 0].groupby([geo_col, 'year'])['so2_emission'].sum().unstack()
+    emis = emis.dropna(subset=[2005, 2010])
+    reduction = ((emis[2005] - emis[2010]) / emis[2005] * 100)
+    reduction = np.clip(reduction.replace([np.inf, -np.inf], np.nan), -100, 100).rename('actual_reduction')
+
+    df05 = df[df['year'] == 2005][['firm_id', geo_col]].rename(columns={geo_col: 'loc_05'})
+    df10 = df[df['year'] == 2010][['firm_id', geo_col]].rename(columns={geo_col: 'loc_10'})
+
+    firms05 = set(df05['firm_id'])
+    firms10 = set(df10['firm_id'])
+
+    exiting = df05[~df05['firm_id'].isin(firms10)]
+    entering = df10[~df10['firm_id'].isin(firms05)]
+
+    both = pd.merge(df05[df05['firm_id'].isin(firms10)], df10[df10['firm_id'].isin(firms05)], on='firm_id')
+    migrating_out = both[both['loc_05'] != both['loc_10']]
+    staying = both[both['loc_05'] == both['loc_10']]
+
+    count_exit = exiting.groupby('loc_05').size()
+    count_enter = entering.groupby('loc_10').size()
+    count_mig_out = migrating_out.groupby('loc_05').size()
+    count_stay = staying.groupby('loc_05').size()
+
+    res = pd.DataFrame(index=emis.index)
+    res['stayed'] = count_stay
+    res['exited'] = count_exit
+    res['entered'] = count_enter
+    res['mig_out'] = count_mig_out
+    res = res.fillna(0)
+
+    res['total_05'] = res['stayed'] + res['exited'] + res['mig_out']
+    res['mig_in'] = migrating_out.groupby('loc_10').size().fillna(0)
+    res['total_10'] = res['stayed'] + res['entered'] + res['mig_in']
+
+    res['migration_rate'] = np.where(res['total_05']>0, (res['mig_out'] / res['total_05']) * 100, 0).round(2)
+    res['exit_rate'] = np.where(res['total_05']>0, (res['exited'] / res['total_05']) * 100, 0).round(2)
+    res['enter_rate'] = np.where(res['total_10']>0, (res['entered'] / res['total_10']) * 100, 0).round(2)
+
+    final_stats = pd.concat([reduction, res[['migration_rate', 'enter_rate', 'exit_rate']]], axis=1)
+    final_stats['actual_reduction'] = final_stats['actual_reduction'].round(2)
+    
+    final_stats.index = final_stats.index.astype(str)
+    final_stats.index.name = 'code' 
+    return final_stats.reset_index()
+
+df_prov_stats = calculate_regional_metrics(df_base, 'prov_code')
+df_city_stats = calculate_regional_metrics(df_base, 'city_code')
+df_county_stats = calculate_regional_metrics(df_base, 'county_code')
+
+df_targets = final_data[['county_code', 'so2_reduction_target_11th_fyp']].copy()
+df_targets['county_code'] = pd.to_numeric(df_targets['county_code'], errors='coerce').astype('Int64')
+
+df_targets['prov_code'] = (df_targets['county_code'] // 10000).astype(str)
+
+target_map = df_targets.dropna(subset=['prov_code', 'so2_reduction_target_11th_fyp']) \
+                       .drop_duplicates('prov_code') \
+                       .set_index('prov_code')['so2_reduction_target_11th_fyp']
+
+df_prov_stats['target_reduction'] = df_prov_stats['code'].map(target_map).round(2)
+
+gdf_p = province_gdf.copy().to_crs(epsg=4326)
+gdf_c = city_gdf.copy().to_crs(epsg=4326)
+gdf_d = district_gdf.copy().to_crs(epsg=4326)
+
+gdf_p['code'] = gdf_p['pr_adcode'].astype(str).str[:2]
+gdf_c['code'] = gdf_c['ct_adcode'].astype(str).str[:4]
+gdf_d['code'] = gdf_d['dt_adcode'].astype(str).str[:6]
+
+import matplotlib.pyplot as plt
+def assign_color(val):
+    if pd.isna(val) or val == 'N/A': return [180, 180, 180, 150] 
+    cmap = plt.get_cmap('RdYlGn')                  
+    norm_val = max(0, min(1, (float(val) + 50) / 100))
+    r, g, b, a = cmap(norm_val)
+    return [int(r*255), int(g*255), int(b*255), 200]
+
+gdf_p = gdf_p.rename(columns={'geometry_province': 'geometry'}).set_geometry('geometry')
+gdf_c = gdf_c.rename(columns={'geometry_city': 'geometry'}).set_geometry('geometry')
+gdf_d = gdf_d.rename(columns={'geometry_district': 'geometry'}).set_geometry('geometry')
+
+gdf_p['geometry'] = gdf_p['geometry'].simplify(tolerance=0.01, preserve_topology=True)
+gdf_c['geometry'] = gdf_c['geometry'].simplify(tolerance=0.005, preserve_topology=True)
+gdf_d['geometry'] = gdf_d['geometry'].simplify(tolerance=0.005, preserve_topology=True)
+
+merged_prov = gdf_p.merge(df_prov_stats, on='code', how='left').fillna("N/A")
+merged_city = gdf_c.merge(df_city_stats, on='code', how='left').fillna("N/A")
+merged_county = gdf_d.merge(df_county_stats, on='code', how='left').fillna("N/A")
+
+keep_cols_prov = ['code', 'geometry', 'target_reduction', 'actual_reduction', 'migration_rate', 'enter_rate', 'exit_rate']
+keep_cols = ['code', 'geometry', 'actual_reduction', 'migration_rate', 'enter_rate', 'exit_rate']
+
+merged_prov = merged_prov[[c for c in keep_cols_prov if c in merged_prov.columns]]
+merged_city = merged_city[[c for c in keep_cols if c in merged_city.columns]]
+merged_county = merged_county[[c for c in keep_cols if c in merged_county.columns]]
+
+merged_prov.to_file(os.path.join(output_data_dir, "map_province.geojson"), driver="GeoJSON")
+merged_city.to_file(os.path.join(output_data_dir, "map_city.geojson"), driver="GeoJSON")
+merged_county.to_file(os.path.join(output_data_dir, "map_county.geojson"), driver="GeoJSON")
+```

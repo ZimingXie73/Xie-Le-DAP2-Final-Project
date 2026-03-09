@@ -1,0 +1,1340 @@
+---
+title: "ASIF × ESR × City Emissions × Border × Policy: Full Data Pipeline"
+format: html
+---
+# ============================================================
+# PURPOSE: 0) Environment setup + user-editable constants
+# INPUTS : (none)
+# OUTPUTS: CONFIG (dict), PATHS (dict), county_coords (DataFrame, optional)
+# ============================================================
+```{python}
+import os
+import re
+import warnings
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+pd.set_option("display.max_columns", 200)
+pd.set_option("display.width", 200)
+
+# -----------------------------
+# User-editable paths (EDIT ME)
+# -----------------------------
+DATA_DIR = Path(r"/Users/xieziming/Xie-Le-DAP2-Final-Project/data")  # <-- change to your folder
+
+PATHS = {
+    # Raw inputs
+    "asif_dta": DATA_DIR / "raw-data" / "ASIF9810_adj.dta",
+    "esr_dta": DATA_DIR / "raw-data" / "ESR_panel_cleaned.dta",
+    "city_xlsx": DATA_DIR / "raw-data" / "地级市工业三废数据 2003-2023年.xlsx",
+    "border_dta": DATA_DIR / "raw-data" / "Province_border_clean.dta",
+    "policy_xlsx": DATA_DIR / "raw-data" / "policy.xlsx",
+
+    # County coordinates (CSV you found)
+    # Put the file here: DATA_DIR/GeoJSON_data/全国县级以上地名代码及经纬度.csv
+    "county_coord_csv": DATA_DIR / "raw-data" / "全国县级以上地名代码及经纬度.csv",
+
+    # Outputs
+    "out_dir": DATA_DIR / "derived-data",
+    "final_parquet": DATA_DIR / "derived-data" / "final_big.parquet",
+}
+
+# --------------------------------------
+# User-editable analysis/data parameters
+# --------------------------------------
+CONFIG = {
+    # Firm-year range filter (optional)
+    "firm_year_min": None,
+    "firm_year_max": None,
+
+    # City emissions year range (required by assignment)
+    "city_year_min": 2003,
+    "city_year_max": 2010,
+
+    # Pollutant priority for "other_pollutant" at firm level
+    "other_pollutant_priority": ["nox_emission", "cod_emission"],
+
+    # City emission variable priority (from city excel) - pick first available
+    "city_emission_priority": [
+        "industrial_so2_emission_ton",
+        "industrial_dust_emission_ton",
+        "industrial_wastewater_emission_10kton",
+    ],
+
+    # How to build city_code from county_code
+    "city_code_mode": "auto",  # options: "auto", "prefix4_00", "prov_0000"
+
+    # Size quartile computation
+    "size_quartile_mode": "within_year",  # options: "within_year", "overall"
+
+    # Save intermediate outputs
+    "save_city_wide": True,
+}
+
+# Ensure output directory exists
+PATHS["out_dir"].mkdir(parents=True, exist_ok=True)
+
+# Quick path diagnostics
+print("cwd:", os.getcwd())
+for k, p in PATHS.items():
+    if isinstance(p, Path) and (p.suffix in [".dta", ".xlsx", ".csv", ".shp", ".geojson", ".parquet"]):
+        print(f"{k}: {p} | exists={p.exists()}")
+
+# OPTIONAL: show key constants as a small table (run-time display)
+config_table = pd.DataFrame([{"key": k, "value": str(v)} for k, v in CONFIG.items()])
+print("\nCONFIG preview:\n", config_table.head(20))
+
+
+# ============================================================
+# NEW: Robust CSV loader for Chinese encodings (GBK/GB18030/UTF-8)
+# ============================================================
+def read_csv_robust(path: Path, encodings=("utf-8-sig", "utf-8", "gb18030", "gbk", "cp936")):
+    """
+    依次尝试常见编码读取 csv，直到成功。
+    - utf-8-sig: 常见带 BOM 的 utf8
+    - gb18030/gbk/cp936: 中文 Windows 常见编码
+    """
+    last_err = None
+    for enc in encodings:
+        try:
+            df = pd.read_csv(path, encoding=enc)
+            print(f"[INFO] Read CSV with encoding='{enc}'")
+            return df
+        except UnicodeDecodeError as e:
+            last_err = e
+            continue
+    raise UnicodeDecodeError(
+        f"Failed to decode CSV with encodings={encodings}. Last error: {repr(last_err)}"
+    )
+def read_csv_robust(path: Path, encodings=("utf-8-sig", "utf-8", "gb18030", "gbk", "cp936")):
+    last_err = None
+    for enc in encodings:
+        try:
+            df = pd.read_csv(path, encoding=enc)
+            print(f"[INFO] Read CSV with encoding='{enc}'")
+            return df
+        except UnicodeDecodeError as e:
+            last_err = e
+    raise UnicodeDecodeError(
+        f"Failed to decode CSV with encodings={encodings}. Last error: {repr(last_err)}"
+    )
+
+# ============================================================
+# NEW: Load county coordinates and rename Chinese headers -> English
+# INPUT : PATHS["county_coord_csv"]
+# OUTPUT: county_coords (county_code, county_name, county_lon, county_lat)
+# ============================================================
+if PATHS["county_coord_csv"].exists():
+    county_coords_raw = read_csv_robust(PATHS["county_coord_csv"])
+
+    # 统一中文表头为英文（满足你的要求：中文表头统一改英文）
+    county_coords = county_coords_raw.rename(columns={
+        "行政代码": "county_code",
+        "地名": "county_name",
+        "东经": "county_lon",
+        "北纬": "county_lat",
+    }).copy()
+
+    # 类型清洗（后面 merge 更稳）
+    county_coords["county_code"] = county_coords["county_code"].astype(str).str.strip()
+    county_coords["county_lon"] = pd.to_numeric(county_coords["county_lon"], errors="coerce")
+    county_coords["county_lat"] = pd.to_numeric(county_coords["county_lat"], errors="coerce")
+
+    # 企业 dq 是 6 位；统一补齐到 6 位
+    county_coords["county_code"] = (
+        county_coords["county_code"]
+        .str.replace(r"\.0$", "", regex=True)
+        .str.zfill(6)
+    )
+
+    # 只保留必要列，去重
+    county_coords = county_coords.dropna(subset=["county_code", "county_lon", "county_lat"]).copy()
+    county_coords = county_coords[["county_code", "county_name", "county_lon", "county_lat"]].drop_duplicates()
+
+    print("\nLoaded county_coords:", county_coords.shape)
+else:
+    county_coords = None
+    print("\n[INFO] county_coord_csv not found yet. county_coords is set to None.")
+```
+
+
+
+# ============================================================
+# PURPOSE: 1) Helper functions (validation, cleaning, dedup, diagnostics)
+# INPUTS : (none)
+# OUTPUTS: helper functions in memory
+# ============================================================
+```{python}
+def require_exists(path: Path, label: str):
+    if not path.exists():
+        raise FileNotFoundError(f"[{label}] file not found: {path}")
+
+def require_columns(df: pd.DataFrame, cols, df_name="df"):
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"[{df_name}] missing columns: {missing}\nAvailable columns sample: {list(df.columns)[:50]}")
+
+def clean_id(x):
+    """
+    Convert id to clean string:
+    - strip spaces
+    - remove trailing '.0' (common when numeric read as float)
+    """
+    if pd.isna(x):
+        return np.nan
+    s = str(x).strip()
+    s = re.sub(r"\.0$", "", s)
+    s = s.replace(" ", "").replace("\u3000", "")
+    return s
+
+def clean_admin_code(x, width=6):
+    """
+    Clean administrative code to fixed-width string (default 6 digits).
+    """
+    if pd.isna(x):
+        return np.nan
+    s = str(x).strip()
+    s = re.sub(r"\.0$", "", s)
+    s = re.sub(r"\D", "", s)  # keep digits only
+    if s == "":
+        return np.nan
+    return s.zfill(width)
+
+def clean_name_exact(x):
+    """
+    Minimal normalization for exact match (still exact after normalization):
+    - remove spaces (normal + full-width)
+    - unify Chinese parentheses to ASCII
+    """
+    if pd.isna(x):
+        return np.nan
+    s = str(x).strip()
+    s = s.replace(" ", "").replace("\u3000", "")
+    s = s.replace("（", "(").replace("）", ")")
+    return s
+
+def coerce_numeric(df: pd.DataFrame, cols, nonnegative_cols=None, df_name="df"):
+    """
+    Convert columns to numeric; set impossible negatives to NaN for specified nonnegative_cols.
+    """
+    if nonnegative_cols is None:
+        nonnegative_cols = []
+    for c in cols:
+        if c not in df.columns:
+            continue
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+        if c in nonnegative_cols:
+            df.loc[df[c] < 0, c] = np.nan
+    return df
+
+def report_key_health(df: pd.DataFrame, key_cols, df_name="df"):
+    """
+    Print empty key counts and duplicate counts for key columns.
+    """
+    print(f"\n[{df_name}] shape={df.shape}")
+    for k in key_cols:
+        if k not in df.columns:
+            print(f"  - key col missing: {k}")
+            continue
+        empty = df[k].isna().sum() + (df[k].astype(str).str.strip() == "").sum()
+        print(f"  - empty {k}: {empty:,}")
+    dups = df.duplicated(subset=key_cols).sum()
+    print(f"  - duplicated rows on key {key_cols}: {dups:,} (dup_rate={dups/len(df):.6f})")
+
+def dedup_by_missingness(df: pd.DataFrame, key_cols, quality_cols, df_name="df"):
+    """
+    Deduplicate by keeping the row with the fewest missing values among quality_cols within each key group.
+    """
+    df = df.copy()
+    for c in quality_cols:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    df["_na_cnt"] = df[quality_cols].isna().sum(axis=1)
+    df = df.sort_values(key_cols + ["_na_cnt"])
+    before = len(df)
+    df = df.drop_duplicates(subset=key_cols, keep="first").drop(columns=["_na_cnt"])
+    after = len(df)
+    print(f"[{df_name}] dedup: dropped {before-after:,} duplicated key rows (kept best by missingness).")
+    return df
+
+def pick_first_available(df: pd.DataFrame, candidates):
+    """
+    Return the first column in candidates that exists in df; else None.
+    """
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+def build_city_code_from_county(county_code: pd.Series, city_code_mode="auto"):
+    """
+    Build a 6-digit city code from a 6-digit county code.
+    - For most prefecture-level cities: city_code = county[:4] + "00"
+    - For municipalities (Beijing/Tianjin/Shanghai/Chongqing): city_code = prov + "0000"
+    """
+    cc = county_code.astype(str).str.zfill(6)
+
+    prov = cc.str[:2]
+    city_prefix4 = cc.str[:4] + "00"
+    prov_0000 = prov + "0000"
+
+    municipalities = {"11", "12", "31", "50"}
+
+    if city_code_mode == "prefix4_00":
+        return city_prefix4
+    if city_code_mode == "prov_0000":
+        return prov_0000
+    # auto
+    out = city_prefix4.copy()
+    out.loc[prov.isin(municipalities)] = prov_0000.loc[prov.isin(municipalities)]
+    return out
+```
+
+
+
+# ============================================================
+# PURPOSE: 2) Define raw columns to load + standardize to English column names
+# INPUTS : CONFIG, PATHS
+# OUTPUTS: ASIF_COLS, ESR_COLS, RENAME dicts
+# ============================================================
+
+```{python}
+# NOTE: We load only needed columns for memory efficiency (fallback to full read if needed).
+
+ASIF_COLS = [
+    "id", "year", "dq", "name",
+    "cic2", "indName", "type",
+    "employment", "output", "profit",
+]
+
+ESR_COLS = [
+    "id_ESR", "year", "dq_ESR", "name_ESR",
+    "so2_emission", "nox_emission", "cod_emission",
+    "output_ESR",
+]
+
+# Standardized English names (firm data already mostly English; we standardize to unified schema)
+ASIF_RENAME = {
+    "id": "id_asif",
+    "dq": "dq_asif",
+    "name": "firm_name_asif",
+    "indName": "industry_name_asif",
+}
+
+ESR_RENAME = {
+    "id_ESR": "id_esr",
+    "dq_ESR": "dq_esr",
+    "name_ESR": "firm_name_esr",
+}
+
+# City excel rename (Chinese headers -> English)
+CITY_RENAME = {
+    "年份": "year",
+    "省份": "province",
+    "城市": "city",
+    "城市代码": "city_code",
+    "所属地域": "macro_region",
+    "工业废水排放量\n(万吨)": "industrial_wastewater_emission_10kton",
+    "工业二氧化硫排放量\n（吨）": "industrial_so2_emission_ton",
+    "工业烟尘排放量\n（吨）": "industrial_dust_emission_ton",
+}
+
+# Border dta rename candidates (Chinese headers -> English)
+# We will apply fuzzy matching in case the exact Chinese strings differ.
+BORDER_RENAME_CANDIDATES = {
+    "county_code": ["县级代码", "县级代碼", "县代码", "县级代码 "],
+    "county_name": ["县级名称", "县级名稱", "县名称", "县级名称 "],
+}
+
+# Policy sheet rename (Chinese headers -> English)
+POLICY_RENAME = {
+    "序号": "idx",
+    "省份": "province",
+    "2005年二氧化硫排放量(万吨)": "so2_2005_10kton",
+    "2010年二氧化硫排放量(万吨)": "so2_2010_actual_10kton",
+    "“十一五”期间二氧化硫减排比例": "so2_reduction_rate_11th_fyp",
+    "2010年二氧化硫计划排放量(万吨)": "so2_2010_planned_10kton",
+    "“十一五”期间二氧化硫减排任务": "so2_reduction_target_11th_fyp",
+    "二氧化硫控制区": "so2_control_zone",
+    "备注": "notes",
+}
+```
+
+
+
+# ============================================================
+# PURPOSE: 3) Read ASIF & ESR (stata), keep needed columns, rename to English
+# INPUTS : PATHS['asif_dta'], PATHS['esr_dta'], ASIF_COLS, ESR_COLS
+# OUTPUTS: ASIF_raw, ESR_raw
+# ============================================================
+```{python}
+require_exists(PATHS["asif_dta"], "ASIF")
+require_exists(PATHS["esr_dta"], "ESR")
+
+# Try reading only required columns; if fails, read full and subset.
+try:
+    ASIF_raw = pd.read_stata(PATHS["asif_dta"], convert_categoricals=False, columns=ASIF_COLS)
+except Exception as e:
+    print("[WARN] ASIF read with columns failed; fallback to full read. Error:", repr(e))
+    ASIF_full = pd.read_stata(PATHS["asif_dta"], convert_categoricals=False)
+    require_columns(ASIF_full, ASIF_COLS, "ASIF_full")
+    ASIF_raw = ASIF_full[ASIF_COLS].copy()
+
+try:
+    ESR_raw = pd.read_stata(PATHS["esr_dta"], convert_categoricals=False, columns=ESR_COLS)
+except Exception as e:
+    print("[WARN] ESR read with columns failed; fallback to full read. Error:", repr(e))
+    ESR_full = pd.read_stata(PATHS["esr_dta"], convert_categoricals=False)
+    require_columns(ESR_full, ESR_COLS, "ESR_full")
+    ESR_raw = ESR_full[ESR_COLS].copy()
+
+ASIF_raw = ASIF_raw.rename(columns=ASIF_RENAME)
+ESR_raw = ESR_raw.rename(columns=ESR_RENAME)
+
+print("ASIF_raw shape:", ASIF_raw.shape)
+print("ESR_raw  shape:", ESR_raw.shape)
+print("ASIF_raw cols:", list(ASIF_raw.columns))
+print("ESR_raw  cols:", list(ESR_raw.columns))
+```
+
+
+
+# ============================================================
+# PURPOSE: 4) Read policy.xlsx (first sheet), detect header row, rename to English, create prov_code
+# INPUTS : PATHS['policy_xlsx'], POLICY_RENAME
+# OUTPUTS: policy_df (English columns), prov_code mapping columns: prov_code, province
+# ============================================================
+```{python}
+require_exists(PATHS["policy_xlsx"], "policy.xlsx")
+
+# Load first sheet with header=None so we can locate true header row
+policy_xls = pd.ExcelFile(PATHS["policy_xlsx"])
+policy_sheet0 = policy_xls.sheet_names[0]
+
+policy_tmp = pd.read_excel(PATHS["policy_xlsx"], sheet_name=policy_sheet0, header=None)
+
+# find first row with enough non-NA cells (robust to leading blank row)
+non_na_counts = policy_tmp.notna().sum(axis=1)
+header_row_idx = int(non_na_counts.idxmax())  # typically 1 in your file
+
+policy_header = policy_tmp.iloc[header_row_idx].tolist()
+policy_body = policy_tmp.iloc[header_row_idx + 1:].copy()
+policy_body.columns = policy_header
+
+# Drop fully empty columns (often first blank column)
+policy_body = policy_body.dropna(axis=1, how="all")
+policy_df = policy_body.copy()
+
+# Rename columns to English
+policy_df = policy_df.rename(columns=POLICY_RENAME)
+
+# Normalize province name to improve mapping robustness
+def normalize_province_cn(x):
+    if pd.isna(x):
+        return np.nan
+    s = str(x).strip()
+    s = s.replace(" ", "").replace("\u3000", "")
+    # remove common suffixes
+    s = re.sub(r"(省|市|自治区|壮族自治区|回族自治区|维吾尔自治区|特别行政区)$", "", s)
+    return s
+
+if "province" in policy_df.columns:
+    policy_df["province"] = policy_df["province"].map(normalize_province_cn)
+
+# Provincial code mapping (two-digit, consistent with admin codes' first 2 digits)
+# NOTE: Commonly used mapping aligned with PRC administrative division codes (GB/T 2260 style).
+PROV_CN2CODE = {
+    "北京": "11", "天津": "12", "河北": "13", "山西": "14", "内蒙古": "15",
+    "辽宁": "21", "吉林": "22", "黑龙江": "23",
+    "上海": "31", "江苏": "32", "浙江": "33", "安徽": "34", "福建": "35", "江西": "36", "山东": "37",
+    "河南": "41", "湖北": "42", "湖南": "43", "广东": "44", "广西": "45", "海南": "46",
+    "重庆": "50", "四川": "51", "贵州": "52", "云南": "53", "西藏": "54",
+    "陕西": "61", "甘肃": "62", "青海": "63", "宁夏": "64", "新疆": "65",
+    "香港": "81", "澳门": "82",
+    "台湾": "71",
+}
+
+policy_df["prov_code"] = policy_df["province"].map(PROV_CN2CODE)
+
+# Convert policy numeric variables
+policy_num_cols = [
+    "so2_2005_10kton", "so2_2010_actual_10kton", "so2_2010_planned_10kton",
+    "so2_reduction_rate_11th_fyp", "so2_reduction_target_11th_fyp",
+]
+policy_df = coerce_numeric(
+    policy_df,
+    cols=policy_num_cols,
+    nonnegative_cols=["so2_2005_10kton", "so2_2010_actual_10kton", "so2_2010_planned_10kton"],
+    df_name="policy_df",
+)
+
+policy_df = policy_df[policy_df["prov_code"].notna()].copy()
+
+print("policy_df sheet used:", policy_sheet0)
+print("policy_df shape:", policy_df.shape)
+print("policy_df columns:", list(policy_df.columns))
+
+# Keep a clean policy subset for merging
+policy_keep = ["prov_code", "province"] + [c for c in policy_num_cols if c in policy_df.columns]
+policy_keep += [c for c in ["so2_control_zone", "notes"] if c in policy_df.columns]
+policy_df = policy_df[policy_keep].copy()
+
+# Diagnostics: unmapped provinces
+unmapped = policy_df[policy_df["prov_code"].isna()]["province"].unique().tolist()
+if len(unmapped) > 0:
+    print("[WARN] policy provinces not mapped to prov_code:", unmapped)
+```
+
+
+
+# ============================================================
+# PURPOSE: 5) Read city_xlsx (sheet contains '线性插值'), rename Chinese headers to English,
+#          filter 2003-2010, create city_long and (optional) city_wide
+# INPUTS : PATHS['city_xlsx'], CITY_RENAME, CONFIG
+# OUTPUTS: city_long (year, city_code, city_year_emission), city_wide (optional)
+# ============================================================
+```{python}
+require_exists(PATHS["city_xlsx"], "city_xlsx")
+
+city_xls = pd.ExcelFile(PATHS["city_xlsx"])
+# auto select sheet containing '线性插值'
+city_sheet_candidates = [s for s in city_xls.sheet_names if "线性插值" in str(s)]
+if len(city_sheet_candidates) == 0:
+    raise ValueError(f"Cannot find sheet containing '线性插值'. Available sheets: {city_xls.sheet_names}")
+city_sheet = city_sheet_candidates[0]
+
+city_df_raw = pd.read_excel(PATHS["city_xlsx"], sheet_name=city_sheet)
+city_df = city_df_raw.rename(columns=CITY_RENAME).copy()
+
+# Ensure all Chinese headers are converted (basic check)
+cn_cols = [c for c in city_df.columns if re.search(r"[\u4e00-\u9fff]", str(c))]
+if len(cn_cols) > 0:
+    print("[WARN] City df still has Chinese column names (please extend CITY_RENAME):", cn_cols)
+
+require_columns(city_df, ["year", "city_code"], "city_df")
+
+# Clean year and city_code
+city_df["year"] = pd.to_numeric(city_df["year"], errors="coerce").astype("Int64")
+city_df["city_code"] = city_df["city_code"].map(lambda x: clean_admin_code(x, width=6))
+
+# Filter year range for city
+y0, y1 = CONFIG["city_year_min"], CONFIG["city_year_max"]
+city_df = city_df[city_df["year"].between(y0, y1)].copy()
+
+# Coerce emission columns to numeric
+for c in ["industrial_wastewater_emission_10kton", "industrial_so2_emission_ton", "industrial_dust_emission_ton"]:
+    if c in city_df.columns:
+        city_df[c] = pd.to_numeric(city_df[c], errors="coerce")
+        city_df.loc[city_df[c] < 0, c] = np.nan
+
+# Choose city emission variable by priority
+city_emission_col = pick_first_available(city_df, CONFIG["city_emission_priority"])
+if city_emission_col is None:
+    raise KeyError(
+        f"Cannot find any city emission variable from priority list: {CONFIG['city_emission_priority']}\n"
+        f"Available columns: {list(city_df.columns)}"
+    )
+
+city_long = city_df[["year", "city_code", city_emission_col]].copy()
+city_long = city_long.rename(columns={city_emission_col: "city_year_emission"})
+city_long = city_long.dropna(subset=["year", "city_code"]).copy()
+
+# If duplicates exist (same city_code-year), aggregate mean (or sum based on your definition)
+dup_city = city_long.duplicated(subset=["year", "city_code"]).sum()
+if dup_city > 0:
+    print(f"[WARN] city_long has {dup_city:,} duplicate city-year rows; aggregating by mean.")
+    city_long = city_long.groupby(["year", "city_code"], as_index=False)["city_year_emission"].mean()
+
+print("city_sheet used:", city_sheet)
+print("city_long shape:", city_long.shape)
+print("city emission variable used:", city_emission_col)
+```
+
+
+
+# ============================================================
+# PURPOSE: 6) Read Province_border_clean.dta, rename Chinese headers to English,
+#          build is_border_county flag list
+# INPUTS : PATHS['border_dta'], BORDER_RENAME_CANDIDATES
+# OUTPUTS: border_list (county_code, is_border_county)
+# ============================================================
+```{python}
+require_exists(PATHS["border_dta"], "Province_border_clean.dta")
+
+border_raw = pd.read_stata(PATHS["border_dta"], convert_categoricals=False)
+
+# Attempt to rename Chinese columns to English using candidate list
+def rename_by_candidates(df, candidates_map):
+    df = df.copy()
+    col_rename = {}
+    for eng, cn_list in candidates_map.items():
+        for cn in cn_list:
+            if cn in df.columns:
+                col_rename[cn] = eng
+                break
+    return df.rename(columns=col_rename)
+
+border_df = rename_by_candidates(border_raw, BORDER_RENAME_CANDIDATES)
+
+# If still not found, try fuzzy find by contains
+if "county_code" not in border_df.columns:
+    for c in border_df.columns:
+        if "县" in str(c) and "码" in str(c):
+            border_df = border_df.rename(columns={c: "county_code"})
+            break
+if "county_name" not in border_df.columns:
+    for c in border_df.columns:
+        if "县" in str(c) and "名" in str(c):
+            border_df = border_df.rename(columns={c: "county_name"})
+            break
+
+if "county_code" not in border_df.columns:
+    raise KeyError(f"Cannot find county code column in border_df. Columns: {list(border_df.columns)}")
+
+border_df["county_code"] = border_df["county_code"].map(lambda x: clean_admin_code(x, width=6))
+border_df = border_df.dropna(subset=["county_code"]).copy()
+
+border_list = border_df[["county_code"]].drop_duplicates().copy()
+border_list["is_border_county"] = True
+
+print("border_df shape:", border_df.shape)
+print("border_list unique counties:", border_list["county_code"].nunique())
+```
+
+
+
+# ============================================================
+# PURPOSE: 7) Prepare ASIF & ESR: clean keys, add name_clean, admin codes, numeric conversion, dedup ASIF
+# INPUTS : ASIF_raw, ESR_raw, CONFIG
+# OUTPUTS: ASIF_clean_dedup, ESR_clean
+# ============================================================
+```{python}
+ASIF = ASIF_raw.copy()
+ESR = ESR_raw.copy()
+
+# Standardize key fields
+ASIF["year"] = pd.to_numeric(ASIF["year"], errors="coerce").astype("Int64")
+ESR["year"] = pd.to_numeric(ESR["year"], errors="coerce").astype("Int64")
+
+ASIF["firm_id"] = ASIF["id_asif"].map(clean_id)
+ESR["firm_id"] = ESR["id_esr"].map(clean_id)
+
+# Clean admin codes: county_code, prov_code
+ASIF["county_code"] = ASIF["dq_asif"].map(lambda x: clean_admin_code(x, width=6))
+ESR["county_code_esr"] = ESR["dq_esr"].map(lambda x: clean_admin_code(x, width=6))
+
+ASIF["prov_code"] = ASIF["county_code"].astype(str).str[:2]
+ESR["prov_code"] = ESR["county_code_esr"].astype(str).str[:2]
+
+# City code from county (for later merge with city emissions)
+ASIF["city_code"] = build_city_code_from_county(ASIF["county_code"], city_code_mode=CONFIG["city_code_mode"])
+ESR["city_code"] = build_city_code_from_county(ESR["county_code_esr"], city_code_mode=CONFIG["city_code_mode"])
+
+# Clean names for exact matching
+ASIF["name_clean"] = ASIF["firm_name_asif"].map(clean_name_exact)
+ESR["name_clean"] = ESR["firm_name_esr"].map(clean_name_exact)
+
+# Optional year filtering for firm-year tables
+if CONFIG["firm_year_min"] is not None:
+    ASIF = ASIF[ASIF["year"] >= CONFIG["firm_year_min"]].copy()
+    ESR = ESR[ESR["year"] >= CONFIG["firm_year_min"]].copy()
+if CONFIG["firm_year_max"] is not None:
+    ASIF = ASIF[ASIF["year"] <= CONFIG["firm_year_max"]].copy()
+    ESR = ESR[ESR["year"] <= CONFIG["firm_year_max"]].copy()
+
+# Remove empty key rows
+def drop_empty_keys(df, key_cols, df_name="df"):
+    df = df.copy()
+    mask = np.zeros(len(df), dtype=bool)
+    for k in key_cols:
+        s = df[k].astype(str).str.strip()
+        mask = mask | df[k].isna() | (s == "") | (s.str.lower() == "nan")
+    dropped = int(mask.sum())
+    out = df.loc[~mask].copy()
+    print(f"[{df_name}] dropped empty key rows: {dropped:,}")
+    return out
+
+ASIF = drop_empty_keys(ASIF, ["firm_id", "year"], "ASIF")
+ESR = drop_empty_keys(ESR, ["firm_id", "year"], "ESR")
+
+# Convert numeric variables and basic plausibility cleaning
+ASIF = coerce_numeric(
+    ASIF,
+    cols=["employment", "output", "profit"],
+    nonnegative_cols=["employment", "output"],
+    df_name="ASIF",
+)
+ESR = coerce_numeric(
+    ESR,
+    cols=["so2_emission", "nox_emission", "cod_emission", "output_ESR"],
+    nonnegative_cols=["so2_emission", "nox_emission", "cod_emission", "output_ESR"],
+    df_name="ESR",
+)
+
+# Diagnostics before dedup
+report_key_health(ASIF, ["firm_id", "year"], "ASIF (pre-dedup)")
+report_key_health(ESR, ["firm_id", "year"], "ESR")
+
+# Deduplicate ASIF by missingness quality rule
+ASIF_quality_cols = ["county_code", "cic2", "type", "employment", "output", "profit", "name_clean"]
+ASIF_clean_dedup = dedup_by_missingness(
+    ASIF,
+    key_cols=["firm_id", "year"],
+    quality_cols=ASIF_quality_cols,
+    df_name="ASIF_clean_dedup",
+)
+
+# ESR: if duplicates exist, keep first by missingness too (should be 0 in your diagnostic earlier)
+if ESR.duplicated(subset=["firm_id", "year"]).sum() > 0:
+    ESR = dedup_by_missingness(
+        ESR,
+        key_cols=["firm_id", "year"],
+        quality_cols=["county_code_esr", "so2_emission", "nox_emission", "cod_emission", "name_clean"],
+        df_name="ESR_dedup",
+    )
+ESR_clean = ESR.copy()
+
+report_key_health(ASIF_clean_dedup, ["firm_id", "year"], "ASIF_clean_dedup (post)")
+report_key_health(ESR_clean, ["firm_id", "year"], "ESR_clean (post)")
+```
+
+
+
+# ============================================================
+# PURPOSE: 8) Merge ASIF × ESR by (firm_id, year) first; create merged_left_id and merged_inner_id
+# INPUTS : ASIF_clean_dedup, ESR_clean
+# OUTPUTS: merged_left_id (with _merge), merged_inner_id
+# ============================================================
+```{python}
+# Keep only necessary columns for merging
+ASIF_keep_cols = [
+    "firm_id", "year",
+    "county_code", "prov_code", "city_code",
+    "cic2", "type", "employment", "output", "profit",
+    "firm_name_asif", "name_clean",
+]
+ESR_keep_cols = [
+    "firm_id", "year",
+    "county_code_esr", "prov_code", "city_code",
+    "so2_emission", "nox_emission", "cod_emission",
+    "firm_name_esr", "name_clean",
+]
+
+ASIF_m = ASIF_clean_dedup[[c for c in ASIF_keep_cols if c in ASIF_clean_dedup.columns]].copy()
+ESR_m = ESR_clean[[c for c in ESR_keep_cols if c in ESR_clean.columns]].copy()
+
+# Left merge by id
+merged_left_id = ASIF_m.merge(
+    ESR_m,
+    on=["firm_id", "year"],
+    how="left",
+    indicator=True,
+    suffixes=("_asif", "_esr"),
+)
+
+merged_left_id["match_method"] = np.where(merged_left_id["_merge"] == "both", "id", "none")
+
+# Inner by id
+merged_inner_id = ASIF_m.merge(
+    ESR_m,
+    on=["firm_id", "year"],
+    how="inner",
+    suffixes=("_asif", "_esr"),
+)
+
+print("\n[MERGE by id] merged_left_id shape:", merged_left_id.shape)
+print("[MERGE by id] merged_inner_id shape:", merged_inner_id.shape)
+print("[MERGE by id] match rate vs ASIF:", round((merged_left_id["_merge"] == "both").mean(), 4))
+print("[MERGE by id] match rate vs ESR :", round(len(merged_inner_id) / len(ESR_m), 4))
+print(merged_left_id["_merge"].value_counts())
+```
+
+
+
+# ============================================================
+# PURPOSE: 9) For rows not matched by id, do exact name match on (year, name_clean) ONLY IF UNIQUE on both sides
+# INPUTS : merged_left_id, ESR_clean
+# OUTPUTS: merged_left (final left with fill), merged_inner (final inner after fill)
+# ============================================================
+
+```{python}
+# -----------------------------
+# Identify unmatched by id
+# -----------------------------
+unmatched = merged_left_id[merged_left_id["_merge"] == "left_only"].copy()
+
+# 使用 ASIF 的清洗后名称列（注意：这里用 name_clean_asif）
+unmatched = unmatched.dropna(subset=["name_clean_asif"]).copy()
+
+# -----------------------------
+# Build ESR table for name matching
+# -----------------------------
+# 使用 ESR 的清洗后名称列（注意：这里用 name_clean_esr）
+esr_name = ESR_clean[[
+    "year", "name_clean",
+    "county_code_esr", "so2_emission", "nox_emission", "cod_emission"
+]].copy()
+
+# 如果你 ESR_clean 里 name_clean 的列名就是 "name_clean"，那下面这行不用改；
+# 如果你 ESR_clean 里叫 "name_clean" 没问题，但 merged_left_id 里叫 name_clean_esr，是两回事。
+esr_name = esr_name.dropna(subset=["name_clean"]).copy()
+
+# 为了和 unmatched 的列名一致，这里把 ESR 的 name_clean 重命名成 name_clean_esr（可选但更清晰）
+esr_name = esr_name.rename(columns={"name_clean": "name_clean_esr"})
+
+# -----------------------------
+# Keep only unique (year, name_clean) on ESR side
+# -----------------------------
+esr_counts = esr_name.groupby(["year", "name_clean_esr"]).size().reset_index(name="n")
+esr_unique = esr_name.merge(esr_counts, on=["year", "name_clean_esr"], how="left")
+esr_unique = esr_unique[esr_unique["n"] == 1].drop(columns=["n"]).copy()
+
+# -----------------------------
+# Keep only unique (year, name_clean) among ASIF-unmatched side
+# -----------------------------
+asif_counts = unmatched.groupby(["year", "name_clean_asif"]).size().reset_index(name="n")
+unmatched_unique = unmatched.merge(asif_counts, on=["year", "name_clean_asif"], how="left")
+unmatched_unique = unmatched_unique[unmatched_unique["n"] == 1].drop(columns=["n"]).copy()
+
+# -----------------------------
+# Name exact match on (year, name_clean)
+# -----------------------------
+fill_by_name = unmatched_unique.merge(
+    esr_unique,
+    left_on=["year", "name_clean_asif"],
+    right_on=["year", "name_clean_esr"],
+    how="left",
+    indicator="name_merge",
+)
+
+fill_by_name = fill_by_name[fill_by_name["name_merge"] == "both"].copy()
+
+print("\n[NAME exact match] candidates (unmatched rows):", len(unmatched))
+print("[NAME exact match] unique candidates:", len(unmatched_unique))
+print("[NAME exact match] successful fills:", len(fill_by_name))
+
+# -----------------------------
+# Build fill lookup keyed by (firm_id, year)
+# IMPORTANT: use *_y columns (from ESR side) as the fill source
+# -----------------------------
+fill_lookup = (
+    fill_by_name
+    .set_index(["firm_id", "year"])[
+        ["county_code_esr_y", "so2_emission_y", "nox_emission_y", "cod_emission_y"]
+    ]
+    .rename(columns={
+        "county_code_esr_y": "county_code_esr",
+        "so2_emission_y": "so2_emission",
+        "nox_emission_y": "nox_emission",
+        "cod_emission_y": "cod_emission",
+    })
+)
+
+# -----------------------------
+# Apply fill to merged_left_id (only where missing)
+# -----------------------------
+merged_left = merged_left_id.copy().set_index(["firm_id", "year"])
+
+for col in ["county_code_esr", "so2_emission", "nox_emission", "cod_emission"]:
+    if col in merged_left.columns:
+        merged_left[col] = merged_left[col].fillna(fill_lookup[col])
+
+merged_left = merged_left.reset_index()
+
+# -----------------------------
+# Update match labels
+# -----------------------------
+merged_left["match_method"] = np.where(
+    merged_left["_merge"] == "both",
+    "id",
+    np.where(~merged_left["so2_emission"].isna(), "name", "none"),
+)
+merged_left["_merge_final"] = np.where(
+    merged_left["match_method"].isin(["id", "name"]),
+    "both",
+    "left_only"
+)
+
+print("[FINAL merge] matched share (id or name):", round((merged_left["_merge_final"] == "both").mean(), 4))
+print(merged_left["match_method"].value_counts(dropna=False))
+
+merged_inner = merged_left[merged_left["_merge_final"] == "both"].copy()
+
+print("merged_left shape:", merged_left.shape)
+print("merged_inner shape:", merged_inner.shape)
+```
+
+
+
+# ============================================================
+# PURPOSE: 10) Merge policy_df (province-level) into firm-year panel by prov_code
+# INPUTS : merged_left, policy_df
+# OUTPUTS: merged_left_pol, merged_inner_pol
+# ============================================================
+```{python}
+# Create unified prov_code for merging policy (prefer ASIF, fallback to ESR)
+if "prov_code" not in merged_left.columns:
+    if "prov_code_asif" in merged_left.columns:
+        merged_left["prov_code"] = merged_left["prov_code_asif"]
+    if "prov_code" not in merged_left.columns and "prov_code_esr" in merged_left.columns:
+        merged_left["prov_code"] = merged_left["prov_code_esr"]
+    # if both exist, prefer ASIF but fill missing with ESR
+    if "prov_code_asif" in merged_left.columns and "prov_code_esr" in merged_left.columns:
+        merged_left["prov_code"] = merged_left["prov_code_asif"].fillna(merged_left["prov_code_esr"])
+
+if "prov_code" not in merged_inner.columns:
+    if "prov_code_asif" in merged_inner.columns:
+        merged_inner["prov_code"] = merged_inner["prov_code_asif"]
+    if "prov_code" not in merged_inner.columns and "prov_code_esr" in merged_inner.columns:
+        merged_inner["prov_code"] = merged_inner["prov_code_esr"]
+    if "prov_code_asif" in merged_inner.columns and "prov_code_esr" in merged_inner.columns:
+        merged_inner["prov_code"] = merged_inner["prov_code_asif"].fillna(merged_inner["prov_code_esr"])
+```
+
+```{python}
+# Policy columns are already English; merge by prov_code
+policy_merge_cols = [c for c in policy_df.columns if c not in ["province"]] + ["province"]
+policy_merge_cols = list(dict.fromkeys(policy_merge_cols))  # stable unique
+
+merged_left_pol = merged_left.merge(
+    policy_df[policy_merge_cols],
+    on="prov_code",
+    how="left",
+    suffixes=("", "_policy"),
+)
+
+merged_inner_pol = merged_inner.merge(
+    policy_df[policy_merge_cols],
+    on="prov_code",
+    how="left",
+    suffixes=("", "_policy"),
+)
+
+print("\n[POLICY merge] merged_left_pol shape:", merged_left_pol.shape)
+print("[POLICY merge] policy missing rate:", round(merged_left_pol["so2_reduction_rate_11th_fyp"].isna().mean(), 4)
+      if "so2_reduction_rate_11th_fyp" in merged_left_pol.columns else "N/A")
+```
+
+
+
+# ============================================================
+# PURPOSE: 11) Merge city emissions (city_long) into firm-year panel by (city_code, year)
+# INPUTS : merged_left_pol, city_long
+# OUTPUTS: merged_left_city, merged_inner_city
+# ============================================================
+```{python}
+# Ensure we have a unified city_code column (prefer ASIF, fallback to ESR)
+for df in [merged_left_pol, merged_inner_pol]:
+    if "city_code" not in df.columns:
+        if "city_code_asif" in df.columns and "city_code_esr" in df.columns:
+            df["city_code"] = df["city_code_asif"].fillna(df["city_code_esr"])
+        elif "city_code_asif" in df.columns:
+            df["city_code"] = df["city_code_asif"]
+        elif "city_code_esr" in df.columns:
+            df["city_code"] = df["city_code_esr"]
+        else:
+            raise KeyError("Cannot find city_code / city_code_asif / city_code_esr in merged data.")
+
+# Make year types consistent for merge
+merged_left_pol["year"] = pd.to_numeric(merged_left_pol["year"], errors="coerce").astype("Int64")
+merged_inner_pol["year"] = pd.to_numeric(merged_inner_pol["year"], errors="coerce").astype("Int64")
+
+city_long["year"] = pd.to_numeric(city_long["year"], errors="coerce").astype("Int64")
+
+# Ensure city_code is clean string
+merged_left_pol["city_code"] = merged_left_pol["city_code"].map(lambda x: clean_admin_code(x, width=6))
+merged_inner_pol["city_code"] = merged_inner_pol["city_code"].map(lambda x: clean_admin_code(x, width=6))
+
+merged_left_city = merged_left_pol.merge(
+    city_long,
+    on=["city_code", "year"],
+    how="left",
+)
+
+merged_inner_city = merged_inner_pol.merge(
+    city_long,
+    on=["city_code", "year"],
+    how="left",
+)
+
+print("\n[CITY merge] merged_left_city shape:", merged_left_city.shape)
+print("[CITY merge] city_year_emission missing rate:",
+      round(merged_left_city["city_year_emission"].isna().mean(), 4))
+```
+
+
+
+# ============================================================
+# PURPOSE: 12) Merge border county flag (is_border_county) into firm-year panel by county_code
+# INPUTS : merged_left_city, border_list
+# OUTPUTS: merged_left_border, merged_inner_border
+# ============================================================
+```{python}
+merged_left_city["county_code"] = merged_left_city["county_code"].map(lambda x: clean_admin_code(x, width=6))
+merged_inner_city["county_code"] = merged_inner_city["county_code"].map(lambda x: clean_admin_code(x, width=6))
+
+merged_left_border = merged_left_city.merge(
+    border_list,
+    on="county_code",
+    how="left",
+)
+merged_left_border["is_border_county"] = merged_left_border["is_border_county"].fillna(False)
+
+merged_inner_border = merged_inner_city.merge(
+    border_list,
+    on="county_code",
+    how="left",
+)
+merged_inner_border["is_border_county"] = merged_inner_border["is_border_county"].fillna(False)
+
+print("\n[BORDER merge] merged_left_border shape:", merged_left_border.shape)
+print("[BORDER merge] border share:", round(merged_left_border["is_border_county"].mean(), 4))
+```
+
+
+
+# ============================================================
+# PURPOSE: 13) Load county coordinates (CSV preferred) and merge into firm-year panels
+# INPUTS :
+#   PATHS, read_csv_robust, clean_admin_code, require_columns
+#   merged_left_border, merged_inner_border
+# OUTPUTS:
+#   county_coords, merged_left_geo, merged_inner_geo
+# ============================================================
+```{python}
+def load_county_coords(PATHS):
+    """
+    Priority:
+      1) county_coord_csv exists -> read (county_code, county_name, county_lon, county_lat)
+      2) county_geojson/shapefile exists -> compute centroid via geopandas
+      3) otherwise -> raise clear error
+    """
+    # ----------------------------------------------------------
+    # Option B: explicit centroid CSV (recommended)
+    # ----------------------------------------------------------
+    if PATHS["county_coord_csv"].exists():
+        coords = read_csv_robust(PATHS["county_coord_csv"])
+
+        # 统一中文表头为英文（满足你的要求：中文表头统一改英文）
+        # 兼容你这份文件的表头：行政代码, 地名, 东经, 北纬
+        rename_map = {
+            # Your CSV (preferred)
+            "行政代码": "county_code",
+            "地名": "county_name",
+            "东经": "county_lon",
+            "北纬": "county_lat",
+
+            # Other possible variants (fallback)
+            "县级代码": "county_code",
+            "县级名称": "county_name",
+            "县代码": "county_code",
+            "县名称": "county_name",
+            "经度": "county_lon",
+            "纬度": "county_lat",
+            "lon": "county_lon",
+            "lat": "county_lat",
+            "LON": "county_lon",
+            "LAT": "county_lat",
+        }
+        coords = coords.rename(columns=rename_map).copy()
+
+        # 如果仍有中文列名残留，提醒你补充 rename_map（不强制报错）
+        cn_cols = [c for c in coords.columns if re.search(r"[\u4e00-\u9fff]", str(c))]
+        if len(cn_cols) > 0:
+            print("[WARN] county_coord_csv still has Chinese column names (extend rename_map):", cn_cols)
+
+        # 硬校验：必须有英文列名
+        require_columns(coords, ["county_code", "county_lon", "county_lat"], "county_coord_csv")
+
+        # 清洗：县代码统一为 6 位数字字符串
+        coords["county_code"] = coords["county_code"].map(lambda x: clean_admin_code(x, width=6))
+
+        # 数值化经纬度
+        coords["county_lon"] = pd.to_numeric(coords["county_lon"], errors="coerce")
+        coords["county_lat"] = pd.to_numeric(coords["county_lat"], errors="coerce")
+
+        # 如存在 county_name，也保留（否则补一个空列，保证下游列稳定）
+        if "county_name" not in coords.columns:
+            coords["county_name"] = np.nan
+
+        # 去掉缺失，去重
+        coords = coords.dropna(subset=["county_code", "county_lon", "county_lat"]).copy()
+        coords = coords[["county_code", "county_name", "county_lon", "county_lat"]].drop_duplicates()
+
+        return coords
+
+    # ----------------------------------------------------------
+    # Option A: boundary file -> centroid (optional)
+    # ----------------------------------------------------------
+    geo_path = None
+    if PATHS["county_geojson"].exists():
+        geo_path = PATHS["county_geojson"]
+    elif PATHS["county_shapefile"].exists():
+        geo_path = PATHS["county_shapefile"]
+
+    if geo_path is not None:
+        try:
+            import geopandas as gpd
+        except Exception as e:
+            raise ImportError(
+                "geopandas is required to compute centroids from a boundary file. "
+                "Install it or provide county_coord_csv instead. "
+                f"Original error: {repr(e)}"
+            )
+
+        gdf = gpd.read_file(geo_path)
+
+        # 中文/常见字段 -> 英文
+        gdf = gdf.rename(columns={
+            "县级代码": "county_code",
+            "县级名称": "county_name",
+            "行政代码": "county_code",
+            "地名": "county_name",
+            "adcode": "county_code",
+            "ADCODE": "county_code",
+        })
+
+        if "county_code" not in gdf.columns:
+            raise KeyError(
+                f"Cannot find county_code field in boundary file: {geo_path}. "
+                f"Available columns: {list(gdf.columns)}"
+            )
+
+        gdf["county_code"] = gdf["county_code"].map(lambda x: clean_admin_code(x, width=6))
+
+        # 尽量转换到 WGS84 输出 lon/lat
+        if gdf.crs is None:
+            print("[WARN] boundary file CRS is None. Assuming it is already lon/lat (EPSG:4326).")
+        else:
+            try:
+                if str(gdf.crs).lower() not in ["epsg:4326", "wgs84"]:
+                    gdf = gdf.to_crs(epsg=4326)
+            except Exception as e:
+                print("[WARN] CRS transform failed; centroid may not be lon/lat. Error:", repr(e))
+
+        # 计算几何中心点
+        gdf["centroid"] = gdf.geometry.centroid
+        gdf["county_lon"] = gdf["centroid"].x
+        gdf["county_lat"] = gdf["centroid"].y
+
+        # 输出标准列
+        if "county_name" not in gdf.columns:
+            gdf["county_name"] = np.nan
+
+        coords = gdf[["county_code", "county_name", "county_lon", "county_lat"]].dropna().drop_duplicates()
+        coords = coords[coords["county_code"].notna()].copy()
+        return pd.DataFrame(coords)
+
+    # ----------------------------------------------------------
+    # Neither source exists -> clear guide
+    # ----------------------------------------------------------
+    raise FileNotFoundError(
+        "County coordinates missing.\n"
+        "Provide ONE of the following:\n"
+        f"  (1) CSV lookup: {PATHS['county_coord_csv']} (columns: 行政代码/地名/东经/北纬 OR county_code/county_lon/county_lat)\n"
+        f"  (2) Boundary file to compute centroid: {PATHS['county_geojson']} OR {PATHS['county_shapefile']}\n"
+        "Then re-run this chunk."
+    )
+
+
+# -----------------------------
+# Load county coords
+# -----------------------------
+county_coords = load_county_coords(PATHS)
+
+print("county_coords shape:", county_coords.shape)
+print("county_coords sample:", county_coords.head(3).to_dict("records"))
+
+# -----------------------------
+# Merge coords into firm-year panels
+# -----------------------------
+merged_left_border["county_code"] = merged_left_border["county_code"].map(lambda x: clean_admin_code(x, width=6))
+merged_inner_border["county_code"] = merged_inner_border["county_code"].map(lambda x: clean_admin_code(x, width=6))
+
+merged_left_geo = merged_left_border.merge(
+    county_coords[["county_code", "county_name", "county_lon", "county_lat"]],
+    on="county_code",
+    how="left",
+)
+merged_inner_geo = merged_inner_border.merge(
+    county_coords[["county_code", "county_name", "county_lon", "county_lat"]],
+    on="county_code",
+    how="left",
+)
+
+print("\n[COORD merge] merged_left_geo shape:", merged_left_geo.shape)
+print("[COORD merge] county_lon missing rate:", round(merged_left_geo["county_lon"].isna().mean(), 4))
+print("[COORD merge] county_lat missing rate:", round(merged_left_geo["county_lat"].isna().mean(), 4))
+```
+
+
+# ============================================================
+# PURPOSE: 14) Final variable construction:
+#          - other_pollutant selection
+#          - so2_percap, so2_intensity
+#          - size_quartile (within_year or overall)
+# INPUTS : merged_left_geo, merged_inner_geo, CONFIG
+# OUTPUTS: merged_left_final, merged_inner_final
+# ============================================================
+```{python}
+def choose_other_pollutant(df: pd.DataFrame, priority):
+    """
+    Choose the first available pollutant column in priority list.
+    If it exists but is nearly all missing, user should adjust priority manually.
+    """
+    for c in priority:
+        if c in df.columns:
+            missing_rate = df[c].isna().mean()
+            print(f"[INFO] candidate other_pollutant={c} missing_rate={missing_rate:.4f}")
+            return c
+    return None
+
+def add_size_quartile(df: pd.DataFrame, mode="within_year"):
+    df = df.copy()
+    # Employment must be positive for size
+    emp = pd.to_numeric(df["employment"], errors="coerce")
+    emp = emp.where(emp > 0, np.nan)
+
+    if mode == "overall":
+        # Global quartiles
+        try:
+            df["size_quartile"] = pd.qcut(emp, 4, labels=[1, 2, 3, 4], duplicates="drop")
+        except Exception:
+            df["size_quartile"] = np.nan
+        return df
+
+    # Within-year quartiles
+    df["size_quartile"] = np.nan
+    for y, g in df.groupby("year", dropna=True):
+        e = pd.to_numeric(g["employment"], errors="coerce").where(pd.to_numeric(g["employment"], errors="coerce") > 0, np.nan)
+        try:
+            q = pd.qcut(e, 4, labels=[1, 2, 3, 4], duplicates="drop")
+            df.loc[g.index, "size_quartile"] = q.astype("float")
+        except Exception:
+            df.loc[g.index, "size_quartile"] = np.nan
+    return df
+
+# Apply to both left and inner
+merged_left_final = merged_left_geo.copy()
+merged_inner_final = merged_inner_geo.copy()
+
+# Select other pollutant
+other_col = choose_other_pollutant(merged_left_final, CONFIG["other_pollutant_priority"])
+if other_col is None:
+    merged_left_final["other_pollutant"] = np.nan
+    merged_left_final["other_pollutant_name"] = None
+    merged_inner_final["other_pollutant"] = np.nan
+    merged_inner_final["other_pollutant_name"] = None
+else:
+    merged_left_final["other_pollutant"] = merged_left_final[other_col]
+    merged_left_final["other_pollutant_name"] = other_col
+    merged_inner_final["other_pollutant"] = merged_inner_final[other_col]
+    merged_inner_final["other_pollutant_name"] = other_col
+
+# Derived variables: so2_percap and so2_intensity
+merged_left_final["employment"] = pd.to_numeric(merged_left_final["employment"], errors="coerce")
+merged_left_final["output"] = pd.to_numeric(merged_left_final["output"], errors="coerce")
+merged_left_final["so2_emission"] = pd.to_numeric(merged_left_final["so2_emission"], errors="coerce")
+
+# Per-capita: require employment > 0
+merged_left_final["so2_percap"] = merged_left_final["so2_emission"] / merged_left_final["employment"].where(merged_left_final["employment"] > 0, np.nan)
+
+# Intensity: require output > 0
+merged_left_final["so2_intensity"] = merged_left_final["so2_emission"] / merged_left_final["output"].where(merged_left_final["output"] > 0, np.nan)
+
+# Repeat for inner
+merged_inner_final["employment"] = pd.to_numeric(merged_inner_final["employment"], errors="coerce")
+merged_inner_final["output"] = pd.to_numeric(merged_inner_final["output"], errors="coerce")
+merged_inner_final["so2_emission"] = pd.to_numeric(merged_inner_final["so2_emission"], errors="coerce")
+merged_inner_final["so2_percap"] = merged_inner_final["so2_emission"] / merged_inner_final["employment"].where(merged_inner_final["employment"] > 0, np.nan)
+merged_inner_final["so2_intensity"] = merged_inner_final["so2_emission"] / merged_inner_final["output"].where(merged_inner_final["output"] > 0, np.nan)
+
+# Size quartile
+merged_left_final = add_size_quartile(merged_left_final, mode=CONFIG["size_quartile_mode"])
+merged_inner_final = add_size_quartile(merged_inner_final, mode=CONFIG["size_quartile_mode"])
+
+print("\n[DERIVED] merged_left_final columns added: other_pollutant, so2_percap, so2_intensity, size_quartile")
+```
+
+```{python}
+print("=== merged_left_final columns (original order) ===")
+print(list(merged_left_final.columns))
+
+print("\n=== merged_left_final columns (sorted) ===")
+print(sorted(merged_left_final.columns))
+```
+
+# ============================================================
+# PURPOSE: 15) Build final_big with required English fields + save to parquet
+# INPUTS : merged_left_final, merged_inner_final, PATHS['final_parquet']
+# OUTPUTS: final_big (from left version), final_big_inner (from inner version)
+# ============================================================
+```{python}
+# Policy vars to keep (province_policy_vars)
+policy_vars = [c for c in [
+    "so2_2005_10kton", "so2_2010_actual_10kton", "so2_2010_planned_10kton",
+    "so2_reduction_rate_11th_fyp", "so2_reduction_target_11th_fyp"
+] if c in merged_left_final.columns]
+
+# Final columns required by user (all English names)
+final_cols = [
+    "year",
+    "firm_id",
+    "county_code",
+    "county_lon",
+    "county_lat",
+    "is_border_county",
+    "city_code",
+    "city_year_emission",
+    "province",      # province name (Chinese value, English header)
+    "prov_code",     # province code (two-digit)
+] + policy_vars + [
+    "so2_emission",
+    "other_pollutant",
+    "other_pollutant_name",
+    "employment",
+    "output",
+    "profit",    quarto render "code/Final Project Part 1.qmd" --to pdf --output "/Users/xieziming/Xie-Le-DAP2-Final-Project/python2_Xie_Sun.pdf"
+    "cic2",
+    "type",
+    "so2_percap",
+    "so2_intensity",
+    "size_quartile",
+    "match_method",
+    "_merge",
+    "_merge_final",
+]
+
+final_cols = [c for c in final_cols if c in merged_left_final.columns]
+
+final_big = merged_left_final[final_cols].copy()
+final_big_inner = merged_inner_final[[c for c in final_cols if c in merged_inner_final.columns]].copy()
+
+print("final_big shape (LEFT):", final_big.shape)
+print("final_big_inner shape (INNER):", final_big_inner.shape)
+print("final_big columns:", list(final_big.columns))
+
+# ============================================================
+# Export CSV
+# ============================================================
+from pathlib import Path
+
+OUT_DIR = PATHS["out_dir"]
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+csv_path = OUT_DIR / "final_big.csv"
+csv_inner_path = OUT_DIR / "final_big_inner.csv"
+
+final_big.to_csv(csv_path, index=False, encoding="utf-8-sig")
+final_big_inner.to_csv(csv_inner_path, index=False, encoding="utf-8-sig")
+
+print("Saved final_big CSV to:", csv_path)
+print("Saved final_big_inner CSV to:", csv_inner_path)
+
+# Preview
+print("\nfinal_big head(10):")
+print(final_big.head(10))
+```

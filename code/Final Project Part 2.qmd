@@ -1,0 +1,225 @@
+---
+title: "Final Project Part 2"
+author: "Ziming Xie"
+format:
+  pdf:
+    include-in-header:
+      text: |
+        % Enable wrapping for Pandoc code blocks in PDF
+        \usepackage{fvextra}
+        \usepackage{float}
+        \usepackage{makecell}
+        \usepackage{booktabs}
+        \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+editor: source
+execute-dir: project
+execute: 
+    echo: true
+---
+
+
+```{python}
+# setup
+import geopandas as gpd
+from os.path import join
+import altair as alt
+import pandas as pd
+import numpy as np
+import time
+import re
+import warnings
+import os
+
+warnings.filterwarnings('ignore')
+alt.renderers.enable("png")
+alt.data_transformers.disable_max_rows()
+
+data_path = 'data/external'
+
+# improve graph resolution
+import tempfile 
+from IPython.display import SVG, display, Image
+import vl_convert as vlc
+
+def display_altair_png(chart, scale=2):
+    """
+    Render an Altair chart to a PNG and display it inline.
+
+    Parameters
+    ----------
+    chart : altair.Chart
+        Altair chart object to render.
+    scale : int, optional
+        Resolution scaling factor for the PNG (default = 2). Use scale=2 for standard slides. Use scale = 3–4 for dense figures or PDF exports.
+    """
+    png_bytes = vlc.vegalite_to_png(chart.to_dict(), scale=scale)
+
+    # Write to a temporary PNG file and display
+    with tempfile.NamedTemporaryFile(suffix=".png") as tmp:
+        tmp.write(png_bytes)
+        tmp.flush()
+        display(Image(filename=tmp.name))
+```
+
+```{python}
+Path = "/Users/xieziming/Xie-Le-DAP2-Final-Project/data/derived-data"
+geojson_path = os.path.join(Path, "District")
+final_path = os.path.join(Path, "final_big.csv")
+district_gdf = gpd.read_file(geojson_path)
+district_gdf = district_gdf[['dt_adcode', 'geometry', 'dt_name']]
+final_df = pd.read_csv(final_path)
+```
+
+```{python}
+final_df['county_code'] = final_df['county_code'].astype('Int64')
+final_df = final_df.dropna(subset=['county_lon', 'county_lat'])
+def clean_year_data(df):
+    df = df.copy()
+    df = df[df['year'].isin(range(2004, 2011))]
+    firm_both = df.groupby('firm_id')['year'].apply(lambda x: (2005 in x.values) and (2010 in x.values))
+    firms_with_both = firm_both[firm_both].index
+    
+    result_dfs = [df[df['firm_id'].isin(firms_with_both)]]
+    firms_without_both = firm_both[~firm_both].index
+    df_remaining = df[df['firm_id'].isin(firms_without_both)].copy()
+    
+
+    mask_need_2005 = ~df_remaining.groupby('firm_id')['year'].transform(lambda x: 2005 in x.values)
+    
+    df_2006 = df_remaining[mask_need_2005 & (df_remaining['year'] == 2006)].copy()
+    df_2006['year'] = 2005
+    
+    df_2004 = df_remaining[mask_need_2005 & (df_remaining['year'] == 2004)].copy()
+    df_2004['year'] = 2005
+
+    mask_need_2010 = ~df_remaining.groupby('firm_id')['year'].transform(lambda x: 2010 in x.values)
+    
+    df_2009 = df_remaining[mask_need_2010 & (df_remaining['year'] == 2009)].copy()
+    df_2009['year'] = 2010
+    
+    df_2008 = df_remaining[mask_need_2010 & (df_remaining['year'] == 2008)].copy()
+    df_2008['year'] = 2010
+    
+    df_remaining = pd.concat([df_remaining, df_2006, df_2004, df_2009, df_2008], ignore_index=True)
+    
+    result_dfs.append(df_remaining[df_remaining['year'].isin([2005, 2010])])
+    
+    final_df = pd.concat(result_dfs, ignore_index=True)
+    return final_df
+
+final_df = clean_year_data(final_df)
+final_df = final_df[final_df['year'].isin([2005, 2010])]
+```
+
+```{python}
+columns_to_drop = ['other_pollutant', 'other_pollutant_name', 'match_method', '_merge', '_merge_final', 'so2_percap', 'so2_intensity']
+final_df = final_df.drop(columns=columns_to_drop, errors='ignore')
+
+final_df['city_code'] = final_df['city_code'].astype('Int64')
+```
+
+```{python}
+firm_2005 = final_df[final_df['year'] == 2005].drop_duplicates('firm_id').set_index('firm_id')[['county_code']].rename(columns={'county_code': 'county_2005'})
+firm_2010 = final_df[final_df['year'] == 2010].drop_duplicates('firm_id').set_index('firm_id')[['county_code']].rename(columns={'county_code': 'county_2010'})
+
+migrate_firms = firm_2005.index.intersection(firm_2010.index)
+migrate_mask = (firm_2005.loc[migrate_firms, 'county_2005'].values != firm_2010.loc[migrate_firms, 'county_2010'].values)
+migrate_set = set(migrate_firms[migrate_mask])
+
+final_df['Migrate'] = final_df['firm_id'].isin(migrate_set).astype(int)
+
+firms_2005_only = firm_2005.index.difference(firm_2010.index)
+final_df['Exit'] = final_df['firm_id'].isin(firms_2005_only).astype(int)
+
+firms_2010_only = firm_2010.index.difference(firm_2005.index)
+final_df['Entry'] = final_df['firm_id'].isin(firms_2010_only).astype(int)
+
+print("Migrate == 1:", (final_df['Migrate'] == 1).sum())
+print("Exit == 1:", (final_df['Exit'] == 1).sum())
+print("Entry == 1:", (final_df['Entry'] == 1).sum())
+
+print("\nFirm_id：")
+print(f"Migrated: {len(migrate_set)}")
+print(f"Exited: {len(firms_2005_only)}")
+print(f"Entered: {len(firms_2010_only)}")
+
+```
+
+```{python}
+def categorize_firm_type(type_code):
+    if type_code in [110, 120, 130, 141, 142, 143, 149, 151, 160]:
+        return 'State-owned'
+    elif type_code in [159, 173, 174, 190, 210, 220, 230, 240]:
+        return 'Private'
+    elif type_code in [310, 320, 330, 340]:
+        return 'Foreign'
+    else:
+        return 'Other'
+
+final_df['Firm_Type'] = final_df['type'].apply(categorize_firm_type)
+
+
+print(final_df['Firm_Type'].value_counts())
+print("\nProportion：")
+print(final_df['Firm_Type'].value_counts(normalize=True))
+```
+
+```{python}
+def map_cic2_to_industry(val):
+    try:
+        clean_val = str(val).strip(" '\"")
+        code = int(float(clean_val))
+    except (ValueError, TypeError):
+        return "Other/Unknown"
+
+    if 1 <= code <= 5:
+        return "Agriculture, Forestry, Animal Husbandry and Fishery"
+    elif 6 <= code <= 11:
+        return "Mining and Quarrying"
+    elif 13 <= code <= 43:
+        return "Manufacturing"
+    elif 44 <= code <= 46:
+        return "Electricity, Gas, Steam and Water Supply"
+    elif 47 <= code <= 50:
+        return "Construction"
+    elif 51 <= code <= 62:
+        return "Wholesale, Retail Trade, Transportation and Accommodation"
+    elif 63 <= code <= 75:
+        return "Information, Finance, Real Estate and Business Services"
+    elif 76 <= code <= 96:
+        return "Public and Other Services"
+    else:
+        return "Other"
+
+if 'cic2' in final_df.columns:
+    final_df['industry_category'] = final_df['cic2'].apply(map_cic2_to_industry)
+    display(final_df['industry_category'].value_counts())
+else:
+    print("Warning: Column 'cic2' not found in final_df!")
+
+```
+
+```{python}
+if 'cic2' in final_df.columns:
+    final_df['cic2'] = final_df['cic2'].astype(str)
+
+output_csv = os.path.join(Path, "final_data_clean.csv")
+final_df.to_csv(output_csv, index=False)
+```
+
+```{python}
+district_gdf['dt_adcode'] = district_gdf['dt_adcode'].astype('Int64')
+final_df['county_code'] = final_df['county_code'].astype('Int64')
+
+final_gdf = final_df.merge(
+    district_gdf[['dt_adcode', 'geometry', 'dt_name']], 
+    left_on='county_code', 
+    right_on='dt_adcode', 
+    how='left'
+)
+
+display(final_gdf[['county_code', 'dt_adcode', 'dt_name', 'geometry']].head(10))
+final_gdf = final_gdf.dropna(subset=['geometry'])
+final_gdf = gpd.GeoDataFrame(final_gdf, geometry='geometry', crs=district_gdf.crs)
+display(final_gdf.head())
+```
